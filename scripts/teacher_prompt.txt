@@ -1,0 +1,43 @@
+Transcribe this scanned document page into Markdown.
+
+Rules:
+- Reproduce all printed content, in the same reading order as the page (top to bottom, left to right).
+- Do not use a fixed template. Use only the labels, headings, and columns that are printed on the page.
+- Use a Markdown table for anything laid out as a table, with the same columns as printed. Use plain lines or lists for other text.
+- Copy every character, number, date, and symbol exactly as printed, including currency symbols and original languages. Do not translate, calculate, correct, or guess.
+- If printed text is unreadable, write [unreadable].
+- Do not add any field that is not on the page.
+- Handwriting, stamps, signatures, and pen marks must not be mixed into the main content. When a mark sits over printed text, transcribe the printed text.
+- At the very end, add a section called "## Handwriting and Stamps". List EVERY non-printed mark on the page, one mark per line, using these formats:
+  - Stamp: <colour>; text = "<exact stamp text, or illegible>"; location = "<where on the page, and which printed lines it overlaps>"
+  - Signature: <colour>; location = "<where on the page, and which printed label or line it is on or next to>"
+  - Handwriting: <colour>; text = "<exact handwritten text, or illegible>"; location = "<where on the page>"; near = "<the printed text it is next to, or the row it belongs to>"
+  - Circle: <colour>; target = "<exact printed or handwritten text inside the circle>"; row = "<the row's line number and/or item code and description, if it is in a table; otherwise the printed label>"; column = "<column header, if in a table>"
+  - Tick: <colour>; target = "<printed text it is next to or over>"; row = "<the row's line number and/or item code and description, if it is in a table; otherwise the printed label>"; column = "<column header the tick is in or closest to>"
+  - Underline, Cross or Strike-through: <colour>; target = "<exact printed text it marks>"; row = "..."; column = "..."
+  - Correction: <colour>; handwritten = "<new text>"; replaces = "<printed or earlier text that it changes or is written over>"; row = "..."
+  - Other mark: <colour>; description = "<what it looks like>"; location = "<where>"
+  Rules for this section:
+  - A circle, tick and a small star, arrow or scribble beside it are separate marks. Give each its own line and its own type. Do not call a circle a tick.
+  - Identify a table row by its printed line number or item code (give both if both exist), plus its description. Several rows can share the same item code or description, so the line number comes first.
+  - Name the column by its printed header. A mark sitting right of one column belongs to the column it is inside, not to the neighbouring column.
+  - Describe only marks you can see. Do not assume a mark on every row because several rows have one. Check each row separately, and do not list a mark on a row that has none.
+  - If you cannot tell which row or column a mark belongs to, write row = "unclear" (or column = "unclear") and give the nearest printed text in near = "...". Do not guess.
+  - A pen stroke or scribble beside a total, date or signature line is a Signature or Handwriting, not a Tick, unless it clearly looks like a check mark.
+  - Write "None" if the page has no non-printed marks.
+- Any block with rows and columns, even a small one with a single data row, must be a Markdown table with the printed column headers.
+- Write plain text exactly as printed. Do not turn text into links, and do not add https:// or any other text that is not on the page.
+- If printed text is cut off at the page edge, copy only the visible part. Do not complete it.
+- Stamps, signatures, and handwriting appear ONLY in the final "## Handwriting and Stamps" section, not in the main content.
+- In that final section, also list printed text that is overwritten or overprinted, and say which line it is on.
+- Every table must have a header row and a separator row, in this style (this also applies to small boxes with one data row, and to totals boxes):
+| Column A | Column B |
+| --- | --- |
+| value 1 | value 2 |
+- One printed row is one table row. If a description wraps onto two lines inside one row, put both lines in the same cell.
+- Signatures, even when they are a printed name like a person's name above "ISSUED BY", are listed only in the final "## Handwriting and Stamps" section.
+- A table runs from its header row down to the dashed or double line that ends it. Everything printed inside that span belongs in the table, including lines such as "Customer Ref No", "Order", item lines, product codes, descriptions, quantities, prices and amounts. Never end a table early, and never leave table rows outside the table, separated from their header.
+- A table's rows keep the printed column alignment: product code under Product Code, description under Description, quantity under Quantity, unit price under Unit Price, amount under Amount. A line that only has text in the first column (e.g. "Customer Ref No : ...") is its own row with the other cells empty.
+- Totals boxes (Sub Total, GST, Total Amount, To Pay) must be a Markdown table too.
+- A line item can span several printed lines. A new table row starts ONLY on a line that has its own Item No./Product Code, Qty, or Amount. Extra description lines printed under an item (with no Item No., Qty or Amount of their own) are part of that item's Description cell: put all of them in the same cell, joined with <br>. Do NOT make a separate row for them.
+- Output only the Markdown, no explanations.
