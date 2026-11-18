@@ -1,15 +1,29 @@
 """Local backend for the Flutter UI (stdlib only). Runs jobs detached, serves logs, scans folds,
 and proxies the model-list call (browsers block cross-origin calls to vLLM/OpenAI).
 Usage: python3 <project>/scripts/server.py [--port 8765]   (binds to 127.0.0.1 only)"""
-import argparse, json, os, re, signal, subprocess, threading, time, urllib.error, urllib.request
+import argparse, io, json, os, re, shlex, shutil, signal, subprocess, sys, threading, time, urllib.error, urllib.request, zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse, parse_qs
 
 ROOT = Path(os.environ.get("FT_ROOT") or os.environ.get("OVIS_FT_ROOT") or Path(__file__).resolve().parents[2])
 STORE = ROOT / ".ui_jobs"
 STORE.mkdir(exist_ok=True)
 INDEX = STORE / "jobs.json"
+WORK = ROOT / ".ui_work"          # one workspace per browser: uploads, dataset, trained model
+WORK.mkdir(exist_ok=True)
+# FT_PUBLIC=1: only the workspace API (/api/ws/...) works; endpoints that run arbitrary commands, list server
+# folders or fetch arbitrary URLs are refused, and jobs are only visible to the workspace that started them.
+PUBLIC = os.environ.get("FT_PUBLIC") == "1"
+MAX_UPLOAD = int(os.environ.get("FT_MAX_UPLOAD_MB", "100")) * 2**20       # Cloudflare free/Pro cap request bodies at 100 MB
+MAX_UNZIPPED = int(os.environ.get("FT_MAX_UNZIPPED_MB", "2000")) * 2**20
+MAX_FILES = 20000
+TEXT_EXT = {".md", ".txt", ".json", ".csv", ".html", ".xml", ".yaml", ".yml", ".tsv", ".log"}
+UPLOAD_EXT = TEXT_EXT | {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".pdf"}
+SLOTS = ("inputs", "labels", "test_inputs", "test_labels")
+STEPS = ("all", "check", "build", "check-train", "check-infer")
+WID_RE = re.compile(r"[a-f0-9]{32}")
+ALLOWED_FILE = Path(__file__).with_name("allowed_models.json")
 
 
 def load():
@@ -42,7 +56,11 @@ def view(j):
             pass
     running = ec is None and bool(alive(j.get("pid")))
     status = "running" if running else ("killed" if ec is None else "done" if ec == 0 else f"failed ({ec})")
-    return {**j, "running": running, "exitCode": ec, "status": status}
+    j = {**j, "running": running, "exitCode": ec, "status": status}
+    if PUBLIC:      # do not leak server paths/commands to browsers
+        j = {k: v for k, v in j.items() if k not in ("cmd", "dir", "pid")}
+        j["cmd"] = ""
+    return j
 
 
 def start(name, cmd, env):
@@ -83,6 +101,194 @@ def hello(model, prefix):
             "info": f"{prefix}\nModel replied ({d['loader']}, load {d['load_s']}s, answer {d['gen_s']}s): \"{d['reply']}\""}
 
 
+def allowed_models():
+    try:
+        return json.loads(ALLOWED_FILE.read_text())
+    except Exception:
+        return []
+
+
+def ws_dir(wid):
+    if not WID_RE.fullmatch(wid or ""):
+        raise ValueError("bad workspace id")
+    return WORK / wid
+
+
+def extract_zip(data, dest):
+    """Safely unpack an uploaded zip into dest (replacing it): no path escapes, symlinks, hidden files or odd types."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("That is not a valid .zip file.")
+    infos = [i for i in zf.infolist() if not i.is_dir()]
+    if len(infos) > MAX_FILES:
+        raise ValueError(f"Too many files in the zip (max {MAX_FILES}).")
+    if sum(i.file_size for i in infos) > MAX_UNZIPPED:
+        raise ValueError(f"The zip expands to more than {MAX_UNZIPPED // 2**20} MB.")
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    base = tmp.resolve()
+    types, skipped = {}, 0
+    for i in infos:
+        parts = PurePosixPath(i.filename).parts
+        ext = PurePosixPath(i.filename).suffix.lower()
+        if (not parts or parts[0] == "/" or ".." in parts or "__MACOSX" in parts or parts[-1].startswith(".")
+                or ext not in UPLOAD_EXT or (i.external_attr >> 16) & 0o170000 == 0o120000):
+            skipped += 1
+            continue
+        target = (tmp / Path(*parts)).resolve()
+        if base not in target.parents:
+            skipped += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(i) as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+        types[ext] = types.get(ext, 0) + 1
+    if not types:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise ValueError("No usable files in the zip. Allowed: " + " ".join(sorted(UPLOAD_EXT)))
+    shutil.rmtree(dest, ignore_errors=True)
+    tmp.rename(dest)
+    return {"files": sum(types.values()), "skipped": skipped, "types": types}
+
+
+def slot_info(d):
+    if not d.is_dir():
+        return None
+    types = {}
+    for f in d.rglob("*"):
+        if f.is_file():
+            types[f.suffix.lower()] = types.get(f.suffix.lower(), 0) + 1
+    return {"files": sum(types.values()), "types": types}
+
+
+def dir_size(d):
+    return sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.is_dir() else 0
+
+
+def ws_status(wid):
+    w = ws_dir(wid)
+    out = w / "out"
+    lora, merged = out / "outputs" / "lora", out / "outputs" / "merged_16bit"
+    summary = None
+    try:
+        summary = json.loads((out / "predictions" / "summary.json").read_text())
+    except Exception:
+        pass
+    try:
+        params = json.loads((w / "params.json").read_text())
+    except Exception:
+        params = None
+    return {"slots": {s: slot_info(w / s) for s in SLOTS},
+            "lora": lora.is_dir(), "loraMB": round(dir_size(lora) / 2**20, 1),
+            "merged": merged.is_dir(), "mergedGB": round(dir_size(merged) / 2**30, 1),
+            "summary": summary, "params": params}
+
+
+def clamp(body, key, lo, hi, default, cast=float):
+    try:
+        v = cast(body.get(key, default))
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number")
+    if not lo <= v <= hi:
+        raise ValueError(f"{key} must be between {lo} and {hi}")
+    return v
+
+
+def ws_run(wid, body):
+    """Build the quick_finetune command on the server from validated fields (the client never sends a command)."""
+    w = ws_dir(wid)
+    step = body.get("step", "all")
+    if step not in STEPS:
+        raise ValueError("unknown step")
+    entry = next((m for m in allowed_models() if m["id"] == body.get("model")), None)
+    if not entry:
+        raise ValueError("Pick a model from the list.")
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt or len(prompt) > 4000:
+        raise ValueError("Write an instruction (max 4000 characters).")
+    if not (w / "inputs").is_dir():
+        raise ValueError("Upload the inputs zip first.")
+    epochs, lr = clamp(body, "epochs", 1, 30, 3), clamp(body, "lr", 1e-6, 1e-2, 1e-4)
+    rank, max_len = clamp(body, "rank", 1, 256, 32, int), clamp(body, "max_len", 512, 32768, 8192, int)
+    max_new, holdout = clamp(body, "max_new", 64, 8192, 2048, int), clamp(body, "holdout", 1, 50, 10)
+    if any(j["running"] for j in (view(x) for x in load()) if j["name"].startswith("ws:")):
+        raise ValueError("A training job is already running; the GPU is shared, so wait for it to finish.")
+    py = ROOT / "venv/bin/python"
+    a = [str(py) if py.exists() else "python3", str(Path(__file__).with_name("quick_finetune.py")),
+         "--model", entry.get("path") or entry["id"], "--prompt", prompt, "--inputs", str(w / "inputs")]
+    if (w / "labels").is_dir():
+        a += ["--labels", str(w / "labels")]
+    if (w / "test_inputs").is_dir():
+        a += ["--test-inputs", str(w / "test_inputs")]
+        if (w / "test_labels").is_dir():
+            a += ["--test-labels", str(w / "test_labels")]
+    else:
+        a += ["--holdout", str(holdout)]
+    a += ["--epochs", str(epochs), "--lr", str(lr), "--rank", str(rank), "--max-len", str(max_len),
+          "--max-new", str(max_new), "--out", str(w / "out"), "--step", step]
+    if step == "all":
+        shutil.rmtree(w / "out" / "outputs", ignore_errors=True)
+        shutil.rmtree(w / "out" / "predictions", ignore_errors=True)
+        (w / "params.json").write_text(json.dumps(
+            {"model": entry["id"], "vision": bool(entry.get("vision")), "prompt": prompt, "epochs": epochs,
+             "lr": lr, "rank": rank, "max_len": max_len}))
+    return start(f"ws:{wid}:{step}", shlex.join(a), {})
+
+
+def readme(params, summary):
+    p = params or {}
+    base, vision = p.get("model", "<base model>"), bool(p.get("vision"))
+    loader = "AutoModelForImageTextToText" if vision else "AutoModelForCausalLM"
+    score = f"\nScore on held-out test files: {json.dumps(summary)}\n" if summary else ""
+    return f"""# Your fine-tuned LoRA adapter
+
+Base model : {base}
+Method     : LoRA (rank {p.get('rank', '?')}), {p.get('epochs', '?')} epoch(s), learning rate {p.get('lr', '?')}
+{score}
+This folder holds only the adapter. Apply it to the same base model:
+
+## Use it directly (no merge)
+```python
+from transformers import {loader}, AutoTokenizer
+from peft import PeftModel
+import torch
+base = {loader}.from_pretrained("{base}", dtype=torch.bfloat16, device_map="auto")
+model = PeftModel.from_pretrained(base, "lora")          # "lora" = the adapter folder from this zip
+tok = AutoTokenizer.from_pretrained("{base}")
+```
+
+## Merge into one standalone model
+```python
+model = model.merge_and_unload()
+model.save_pretrained("merged"); tok.save_pretrained("merged")
+```
+
+## vLLM
+`vllm serve {base} --enable-lora --lora-modules mine=lora`   (then request model "mine")
+
+## IMPORTANT: use the same instruction as in training
+The model learned to answer this instruction (also saved as prompt.txt). Put it before every input,
+as one user message: instruction, a blank line, then the input text.
+
+{p.get('prompt', '')}
+"""
+
+
+class _Stream:
+    """Write-only wrapper so zipfile can stream straight to the HTTP socket (no big temp file)."""
+    def __init__(self, w):
+        self.w = w
+
+    def write(self, b):
+        self.w.write(b)
+        return len(b)
+
+    def flush(self):
+        self.w.flush()
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -92,7 +298,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8" if raw else "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Workspace")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
@@ -101,16 +307,52 @@ class H(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._send({})
 
+    def _owns(self, j):
+        """Public mode: a browser only sees jobs started from its own workspace (header X-Workspace)."""
+        return not PUBLIC or j["name"].startswith(f"ws:{self.headers.get('X-Workspace', '-')}:")
+
+    def _download(self, wid, what):
+        base = ws_dir(wid) / "out" / "outputs"
+        src = base / ("lora" if what == "lora" else "merged_16bit")
+        if what not in ("lora", "merged") or not src.is_dir():
+            return self._send({"error": "nothing to download yet"}, 404)
+        name = "lora-adapter" if what == "lora" else "merged-model"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}.zip"')
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        st = ws_status(wid)
+        with zipfile.ZipFile(_Stream(self.wfile), "w", zipfile.ZIP_STORED) as zf:
+            for f in sorted(src.rglob("*")):
+                if f.is_file():
+                    zf.write(f, f"{'lora' if what == 'lora' else 'merged-model'}/{f.relative_to(src)}")
+            if what == "lora":
+                zf.writestr("README.md", readme(st["params"], st["summary"]))
+                zf.writestr("prompt.txt", (st["params"] or {}).get("prompt", ""))
+
     def do_GET(self):
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         parts = u.path.strip("/").split("/")
         if u.path == "/api/info":
-            return self._send({"root": str(ROOT)})
+            return self._send({"root": "" if PUBLIC else str(ROOT), "public": PUBLIC})
+        if u.path == "/api/allowed-models":
+            return self._send([{k: m.get(k) for k in ("id", "label", "vision", "note")} for m in allowed_models()])
+        if len(parts) >= 4 and parts[:2] == ["api", "ws"]:
+            try:
+                if parts[3] == "status" and len(parts) == 4:
+                    return self._send(ws_status(parts[2]))
+                if parts[3] == "download" and len(parts) == 4:
+                    return self._download(parts[2], q.get("what", "lora"))
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
+        if PUBLIC and (u.path in ("/api/ls", "/api/folds")):
+            return self._send({"error": "disabled in public mode"}, 403)
         if u.path == "/api/jobs":
-            return self._send([view(j) for j in load()])
+            return self._send([view(j) for j in load() if self._owns(j)])
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "log":
-            j = next((j for j in load() if j["id"] == parts[2]), None)
+            j = next((j for j in load() if j["id"] == parts[2] and self._owns(j)), None)
             if not j:
                 return self._send("not found", 404, raw=True)
             f = Path(j["dir"]) / "log.txt"
@@ -159,12 +401,37 @@ class H(BaseHTTPRequestHandler):
         self._send("not found", 404, raw=True)
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-        parts = urlparse(self.path).path.strip("/").split("/")
+        u = urlparse(self.path)
+        parts = u.path.strip("/").split("/")
+        n = int(self.headers.get("Content-Length", 0))
+        if len(parts) == 5 and parts[:2] == ["api", "ws"] and parts[3] == "upload":   # raw zip body
+            try:
+                slot = parts[4]
+                if slot not in SLOTS:
+                    raise ValueError("unknown slot")
+                if n > MAX_UPLOAD:
+                    self.rfile.read(0)
+                    return self._send({"error": f"Zip is larger than {MAX_UPLOAD // 2**20} MB."}, 413)
+                w = ws_dir(parts[2])
+                w.mkdir(exist_ok=True)
+                return self._send({"ok": True, **extract_zip(self.rfile.read(n), w / slot)})
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
+        try:
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return self._send({"error": "bad request body"}, 400)
+        if len(parts) == 4 and parts[:2] == ["api", "ws"] and parts[3] == "run":
+            try:
+                return self._send(view(ws_run(parts[2], body)))
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
+        if PUBLIC and not (len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "stop"):
+            return self._send({"error": "disabled in public mode"}, 403)
         if parts == ["api", "jobs"]:
             return self._send(view(start(body["name"], body["cmd"], body.get("env", {}))))
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "stop":
-            j = next((j for j in load() if j["id"] == parts[2]), None)
+            j = next((j for j in load() if j["id"] == parts[2] and self._owns(j)), None)
             if j and alive(j.get("pid")):
                 def _kill(pid=j["pid"]):
                     for sig, wait in ((signal.SIGTERM, 8), (signal.SIGKILL, 0)):

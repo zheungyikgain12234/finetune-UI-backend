@@ -1,0 +1,6 @@
+[
+  {"id": "Qwen/Qwen3-8B", "label": "Qwen3-8B (text only: .md/.txt/.json inputs)", "vision": false,
+   "path": "/home/zheungyik/8b-mdJson-finetune/base/Qwen3-8B"},
+  {"id": "unsloth/Qwen3-VL-8B-Instruct", "label": "Qwen3-VL-8B-Instruct (reads images and PDFs)", "vision": true},
+  {"id": "ATH-MaaS/OvisOCR2", "label": "OvisOCR2 (OCR; reads images and PDFs)", "vision": true}
+]

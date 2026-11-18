@@ -219,7 +219,7 @@ class Section extends StatelessWidget {
   );
 }
 
-/// Live log viewer for one job. "Live" polls every 2s; "Refresh" is a manual tail.
+/// Log viewer for one job. It polls every 2s; "Refresh" is a manual tail.
 class LogViewer extends StatefulWidget {
   const LogViewer({super.key, required this.runner, required this.job});
   final JobRunner runner;
@@ -230,7 +230,6 @@ class LogViewer extends StatefulWidget {
 
 class _LogViewerState extends State<LogViewer> {
   Timer? _t;
-  bool live = true;
   String text = '';
   final scroll = ScrollController();
 
@@ -238,19 +237,13 @@ class _LogViewerState extends State<LogViewer> {
   void initState() {
     super.initState();
     _refresh();
-    _setLive(true);
+    _t = Timer.periodic(const Duration(seconds: 2), (_) => _refresh());
   }
 
   @override
   void didUpdateWidget(LogViewer old) {
     super.didUpdateWidget(old);
     if (old.job.id != widget.job.id) _refresh();
-  }
-
-  void _setLive(bool v) {
-    live = v;
-    _t?.cancel();
-    if (v) _t = Timer.periodic(const Duration(seconds: 2), (_) => _refresh());
   }
 
   Future<void> _refresh() async {
@@ -283,8 +276,6 @@ class _LogViewerState extends State<LogViewer> {
                 style: Theme.of(context).textTheme.titleSmall,
               ),
             ),
-            const Text('Live'),
-            Switch(value: live, onChanged: (v) => setState(() => _setLive(v))),
             IconButton(
               tooltip: 'Refresh now',
               icon: const Icon(Icons.refresh),

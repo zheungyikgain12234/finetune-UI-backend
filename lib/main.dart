@@ -40,20 +40,6 @@ class _HomeState extends State<Home> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Fine-tune Studio'),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: Center(
-              child: ListenableBuilder(
-                listenable: runner,
-                builder: (_, __) => Text(
-                  'workspace: ${runner.root}',
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-            ),
-          ),
-        ],
       ),
       body: AnimatedBuilder(
         animation: runner,

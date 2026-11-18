@@ -1,3 +1,4 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../services/job_runner.dart';
@@ -27,12 +28,10 @@ class _StudentScreenState extends State<StudentScreen> {
   String? recipeName;
   String? msg;
 
-  // Quick mode: model id + train/test folders + epochs; no recipe needed.
+  // Quick mode: pick a model, upload zips, train. Everything lives in a server-side workspace (no folder paths).
   bool quick = true;
-  final qModel = TextEditingController(text: 'ATH-MaaS/OvisOCR2');
-  final qTrain = TextEditingController();
-  final qTest = TextEditingController();
-  final qTestLab = TextEditingController();
+  List<Map<String, dynamic>> models = [];
+  String? qModelId;
   final qPrompt = TextEditingController(
     text: 'Convert the input into the JSON described by the training examples. Output only the JSON.',
   );
@@ -42,36 +41,71 @@ class _StudentScreenState extends State<StudentScreen> {
   final qMaxLen = TextEditingController(text: '8192');
   final qMaxNew = TextEditingController(text: '2048');
   bool sepTest = false;
-  final qLabels = TextEditingController();
-  final qOut = TextEditingController();
   double qEpochs = 3;
-  bool? modelOk;
-  bool modelTesting = false;
-  String? modelInfo;
+  Map<String, dynamic> ws = {};
+  String? uploading;
+  final uploadMsg = <String, String>{};
 
-  Future<void> testModel() async {
-    setState(() {
-      modelTesting = true;
-      modelInfo = null;
-      modelOk = null;
-    });
+  Future<void> loadModels() async {
     try {
-      final res = await r.testHfModel(qModel.text);
+      final l = await r.allowedModels();
       if (!mounted) return;
       setState(() {
-        modelOk = res['ok'] == true;
-        modelInfo = '${res['info'] ?? res['error']}';
+        models = l;
+        qModelId ??= l.isNotEmpty ? l.first['id'] as String : null;
       });
+    } catch (_) {}
+  }
+
+  Future<void> refreshWs() async {
+    if (r.wid.isEmpty || r.error != null) return;
+    try {
+      final w = await r.wsStatus();
+      if (mounted) setState(() => ws = w);
+    } catch (_) {}
+  }
+
+  Future<void> pickZip(String slot) async {
+    try {
+      final f = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: ['zip'],
+        dialogTitle: 'Choose a .zip',
+      );
+      if (f == null) return;
+      setState(() {
+        uploading = slot;
+        uploadMsg.remove(slot);
+      });
+      final res = await r.uploadZip(slot, await f.readAsBytes());
+      uploadMsg[slot] =
+          '${f.name}: ${res['files']} file(s)${res['skipped'] > 0 ? ', ${res['skipped']} skipped (unsupported or unsafe)' : ''}';
+      await refreshWs();
     } catch (e) {
-      if (mounted) {
-        setState(() {
-          modelOk = false;
-          modelInfo = 'Could not reach the backend: $e';
-        });
-      }
+      uploadMsg[slot] = 'Upload failed: $e';
     } finally {
-      if (mounted) setState(() => modelTesting = false);
+      if (mounted) setState(() => uploading = null);
     }
+  }
+
+  /// One upload tile: what to put in the zip, a button, and what the server received.
+  Widget _uploadTile(String slot, String title, String hint) {
+    final info = (ws['slots'] as Map?)?[slot] as Map?;
+    final types = info == null ? '' : (info['types'] as Map).entries.map((e) => '${e.value}× ${e.key}').join(', ');
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(info != null ? Icons.check_circle : Icons.upload_file, color: info != null ? Colors.green : null),
+      title: Text(title),
+      subtitle: Text(uploadMsg[slot] ?? (info != null ? 'Uploaded: ${info['files']} file(s) ($types)' : hint)),
+      trailing: OutlinedButton.icon(
+        onPressed: uploading != null ? null : () => pickZip(slot),
+        icon: uploading == slot
+            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+            : const Icon(Icons.folder_zip_outlined),
+        label: Text(info != null ? 'Replace .zip' : 'Choose .zip'),
+      ),
+    );
   }
 
   JobRunner get r => widget.runner;
@@ -133,6 +167,7 @@ class _StudentScreenState extends State<StudentScreen> {
   }
 
   Future<void> rescan() async {
+    if (quick) refreshWs();
     if (recipes.isEmpty && r.error == null) loadRecipes();
     final l = await r.folds(
       foldsDir.text,
@@ -146,6 +181,7 @@ class _StudentScreenState extends State<StudentScreen> {
   @override
   void initState() {
     super.initState();
+    loadModels();
     loadRecipes();
     r.addListener(rescan);
   }
@@ -297,13 +333,13 @@ class _StudentScreenState extends State<StudentScreen> {
     ),
   );
 
-  String get qJob => 'train:quick:${qOut.text.trim()}';
-  String qTestJob(String step) => 'train:quick-test-$step:${qOut.text.trim()}';
+  String get qJob => 'ws:${r.wid}:all';
+  String qTestJob(String step) => 'ws:${r.wid}:$step';
+  bool get _busy => r.jobs.any((x) => x.name.startsWith('ws:') && x.running);
 
   /// One row per pipeline step: what it checks, and a Test button that runs just that step as a small job.
   Widget _testRow(String step, String title, String what) {
     final j = r.byName(qTestJob(step));
-    final busy = r.jobs.any((x) => x.name.startsWith('train:') && x.running);
     final icon = j == null
         ? Icons.radio_button_unchecked
         : j.running
@@ -322,7 +358,7 @@ class _StudentScreenState extends State<StudentScreen> {
         spacing: 4,
         children: [
           OutlinedButton(
-            onPressed: busy ? null : () => startQuick(step),
+            onPressed: _busy ? null : () => startQuick(step),
             child: const Text('Test'),
           ),
           if (j != null)
@@ -336,29 +372,30 @@ class _StudentScreenState extends State<StudentScreen> {
   }
 
   Future<void> startQuick([String step = 'all']) async {
-    final need = [qModel, qTrain, qLabels, qPrompt, qOut, if (sepTest) qTest];
-    if (need.any((c) => c.text.trim().isEmpty)) {
-      setState(
-        () => msg = 'Fill in the model, instruction, inputs folder, labels folder, test split and output folder.',
-      );
+    if (qModelId == null || qPrompt.text.trim().isEmpty) {
+      setState(() => msg = 'Pick a model and write an instruction.');
       return;
     }
-    if (r.jobs.any((j) => j.name.startsWith('train:') && j.running)) {
-      setState(
-        () => msg = 'A training job is already running; the GPU is shared, so wait or stop it first.',
-      );
+    if ((ws['slots'] as Map?)?['inputs'] == null) {
+      setState(() => msg = 'Upload the inputs .zip first.');
       return;
     }
-    String t(TextEditingController c) => shq(c.text.trim());
-    final cmd =
-        'python3 ${shq('${r.root}/ovis_ft_ui/scripts/quick_finetune.py')} '
-        '--model ${t(qModel)} --prompt ${t(qPrompt)} --inputs ${t(qTrain)} --labels ${t(qLabels)} '
-        '${sepTest ? '--test-inputs ${t(qTest)} --test-labels ${shq(qTestLab.text.trim().isEmpty ? qTest.text.trim() : qTestLab.text.trim())}' : '--holdout ${double.tryParse(qHoldout.text) ?? 10}'} '
-        '--epochs ${qEpochs.round()} --lr ${double.tryParse(qLr.text) ?? 1e-4} --rank ${int.tryParse(qRank.text) ?? 32} '
-        '--max-len ${int.tryParse(qMaxLen.text) ?? 8192} --max-new ${int.tryParse(qMaxNew.text) ?? 2048} '
-        '--out ${t(qOut)} --step $step';
+    if (sepTest && (ws['slots'] as Map?)?['test_inputs'] == null) {
+      setState(() => msg = 'Upload the test inputs .zip, or switch to "Hold out part of the data".');
+      return;
+    }
     try {
-      await r.start(step == 'all' ? qJob : qTestJob(step), cmd);
+      await r.wsRun({
+        'step': step,
+        'model': qModelId,
+        'prompt': qPrompt.text.trim(),
+        'holdout': double.tryParse(qHoldout.text) ?? 10,
+        'epochs': qEpochs.round(),
+        'lr': double.tryParse(qLr.text) ?? 1e-4,
+        'rank': int.tryParse(qRank.text) ?? 32,
+        'max_len': int.tryParse(qMaxLen.text) ?? 8192,
+        'max_new': int.tryParse(qMaxNew.text) ?? 2048,
+      });
       setState(() => msg = 'Started. Open Logs to watch progress.');
     } catch (e) {
       setState(() => msg = '$e');
@@ -388,8 +425,50 @@ class _StudentScreenState extends State<StudentScreen> {
     ),
   );
 
+  Widget _downloads() {
+    if (ws['lora'] != true) return const SizedBox.shrink();
+    final score = ws['summary'] is Map ? (ws['summary'] as Map)['mean_score'] : null;
+    return Card(
+      margin: const EdgeInsets.only(top: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Your fine-tuned model', style: Theme.of(context).textTheme.titleSmall),
+            if (score != null) Text('Score on the held-out test files: ${(score as num).toStringAsFixed(3)}'),
+            gap(8),
+            const Text(
+              'Download the LoRA adapter (small). It includes a README that shows how to use it with the base model, '
+              'or merge it into one model on your own machine, plus the instruction you trained with.',
+            ),
+            gap(8),
+            Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: () => r.download('lora'),
+                  icon: const Icon(Icons.download),
+                  label: Text('Download LoRA adapter (${ws['loraMB']} MB)'),
+                ),
+                if (ws['merged'] == true)
+                  OutlinedButton.icon(
+                    onPressed: () => r.download('merged'),
+                    icon: const Icon(Icons.archive_outlined),
+                    label: Text('Merged model (${ws['mergedGB']} GB)'),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   List<Widget> _quickSections() {
     final j = r.byName(qJob);
+    final vision = models.where((m) => m['id'] == qModelId).any((m) => m['vision'] == true);
     return [
       Card(
         color: Theme.of(context).colorScheme.secondaryContainer,
@@ -398,101 +477,59 @@ class _StudentScreenState extends State<StudentScreen> {
           padding: EdgeInsets.all(16),
           child: Text(
             'Teach a model to turn INPUT files into LABEL files: Markdown → JSON, image → text, PDF → Markdown, text → text.\n'
-            '1. Pick a Hugging Face model and write an instruction.  2. Point to the inputs and the labels folders '
-            '(files are paired by name: a.md ↔ a.json).  3. Choose how to hold out test files.  4. Test each step, then Start.\n'
-            'After training, the model is run on the test files and scored against your labels.',
+            '1. Pick a model and write an instruction.  2. Upload a .zip of inputs and a .zip of labels '
+            '(files are paired by name: a.md ↔ a.json; one zip with both also works).  3. Choose how to hold out test files.  '
+            '4. Test each step, then Start.\n'
+            'After training you can download the LoRA adapter.',
           ),
         ),
       ),
       Section(
         'Fine-tune a student model',
         children: [
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: qModel,
-                  onChanged: (_) => setState(() {
-                    modelOk = null;
-                    modelInfo = null;
-                  }),
-                  decoration: const InputDecoration(
-                    labelText: 'Hugging Face model id',
-                    helperText: 'e.g. Qwen/Qwen3-VL-8B-Instruct (or a local folder path)',
-                    border: OutlineInputBorder(),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: FilledButton.tonalIcon(
-                  onPressed: modelTesting ? null : testModel,
-                  icon: modelTesting
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.wifi_tethering),
-                  label: const Text('Test connection'),
-                ),
-              ),
+          DropdownButtonFormField<String>(
+            initialValue: qModelId,
+            isExpanded: true,
+            items: [
+              for (final m in models)
+                DropdownMenuItem(value: m['id'] as String, child: Text('${m['label'] ?? m['id']}')),
             ],
-          ),
-          if (modelInfo != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(
-                    modelOk == true ? Icons.check_circle : Icons.error,
-                    size: 18,
-                    color: modelOk == true ? Colors.green : Colors.redAccent,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text(modelInfo!)),
-                ],
-              ),
+            onChanged: (v) => setState(() => qModelId = v),
+            decoration: InputDecoration(
+              labelText: 'Model to fine-tune',
+              helperText: models.isEmpty
+                  ? 'Loading the model list from the server…'
+                  : qModelId ?? '',
+              border: const OutlineInputBorder(),
             ),
-          gap(),
+          ),
           gap(),
           TextField(
             controller: qPrompt,
             minLines: 2,
             maxLines: 6,
             decoration: const InputDecoration(
-              labelText:
-                  'Instruction: what should the model do with each input?',
+              labelText: 'Instruction: what should the model do with each input?',
               helperText: 'Shown to the model before every input, in training and at test time. Be specific about the output format.',
               border: OutlineInputBorder(),
             ),
           ),
           gap(),
-          FolderField(
-            runner: r,
-            label: 'Inputs folder (what the model reads: .md .txt .json, images, or PDFs)',
-            controller: qTrain,
+          _uploadTile(
+            'inputs',
+            'Inputs (.zip)',
+            'What the model reads: .md .txt .json${vision ? ', images or PDFs' : ''}.',
           ),
-          gap(),
-          FolderField(
-            runner: r,
-            label: 'Labels folder (what it should produce: .json .md .txt; same file names as the inputs)',
-            controller: qLabels,
+          _uploadTile(
+            'labels',
+            'Labels (.zip, optional if they are in the inputs zip)',
+            'What it should produce: .json .md .txt, same file names as the inputs.',
           ),
           gap(),
           SegmentedButton<bool>(
             segments: const [
-              ButtonSegment(
-                value: false,
-                label: Text('Hold out part of the data as test'),
-              ),
-              ButtonSegment(
-                value: true,
-                label: Text('Use separate test folders'),
-              ),
+              ButtonSegment(value: false, label: Text('Hold out part of the data as test')),
+              ButtonSegment(value: true, label: Text('Upload separate test files')),
             ],
             selected: {sepTest},
             onSelectionChanged: (v) => setState(() => sepTest = v.first),
@@ -511,57 +548,21 @@ class _StudentScreenState extends State<StudentScreen> {
               ),
             )
           else ...[
-            FolderField(
-              runner: r,
-              label: 'Test inputs folder (never trained on)',
-              controller: qTest,
-            ),
-            gap(),
-            FolderField(
-              runner: r,
-              label: 'Test labels folder (optional: leave empty if next to the test inputs)',
-              controller: qTestLab,
-            ),
+            _uploadTile('test_inputs', 'Test inputs (.zip, never trained on)', 'Same kind of files as the inputs.'),
+            _uploadTile('test_labels', 'Test labels (.zip, optional)', 'Leave empty if they are in the test inputs zip.'),
           ],
-          gap(),
-          FolderField(
-            runner: r,
-            label: 'Save results to (dataset, model, predictions, scores)',
-            controller: qOut,
-          ),
           gap(),
           Text(
             'Test each step first (quick, nothing is trained)',
             style: Theme.of(context).textTheme.titleSmall,
           ),
-          _testRow(
-            'check',
-            '1. Folders',
-            'Pairs inputs with labels by file name, shows the file types, checks train and test do not overlap.',
-          ),
-          _testRow(
-            'build',
-            '2. Dataset',
-            'Builds the training dataset (train / validation / test files) from your pairs.',
-          ),
-          _testRow(
-            'check-train',
-            '3. Model & training format',
-            'Loads the model and tokenizes one example; the trained-on text must be your label, not your input.',
-          ),
-          _testRow(
-            'check-infer',
-            '4. Inference',
-            'Runs the original (not yet fine-tuned) model on 1 test example and prints its answer.',
-          ),
+          _testRow('check', '1. Files', 'Pairs inputs with labels by file name, shows the file types, checks train and test do not overlap.'),
+          _testRow('build', '2. Dataset', 'Builds the training dataset (train / validation / test files) from your pairs.'),
+          _testRow('check-train', '3. Model & training format', 'Loads the model and tokenizes one example; the trained-on text must be your label, not your input.'),
+          _testRow('check-infer', '4. Inference', 'Runs the original (not yet fine-tuned) model on 1 test example and prints its answer.'),
           const Divider(),
-          Text(
-            'Epochs: ${qEpochs.round()}',
-            style: Theme.of(context).textTheme.titleSmall,
-          ),
-          help(
-            'One epoch = one full pass over the train set. More epochs learn longer but take longer; 3 is a safe start.',
-          ),
+          Text('Epochs: ${qEpochs.round()}', style: Theme.of(context).textTheme.titleSmall),
+          help('One epoch = one full pass over the train set. More epochs learn longer but take longer; 3 is a safe start.'),
           Slider(
             value: qEpochs,
             min: 1,
@@ -570,39 +571,6 @@ class _StudentScreenState extends State<StudentScreen> {
             label: '${qEpochs.round()}',
             onChanged: (v) => setState(() => qEpochs = v),
           ),
-          ExpansionTile(
-            tilePadding: EdgeInsets.zero,
-            title: const Text('Advanced training settings'),
-            childrenPadding: const EdgeInsets.only(bottom: 8),
-            children: [
-              Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                children: [
-                  f(
-                    'lr',
-                    qLr,
-                    hint: 'Learning rate. Leave the default unless results are unstable.',
-                  ),
-                  f(
-                    'rank',
-                    qRank,
-                    hint: 'LoRA rank: adapter capacity. Higher = more capacity and GPU memory.',
-                  ),
-                  f(
-                    'Max length',
-                    qMaxLen,
-                    hint: 'Max tokens per example (input + label). Raise it if the dataset test says an example is too long.',
-                  ),
-                  f(
-                    'Max new tokens',
-                    qMaxNew,
-                    hint: 'Longest answer the model may generate at test time.',
-                  ),
-                ],
-              ),
-            ],
-          ),
           gap(),
           Wrap(
             spacing: 12,
@@ -610,7 +578,7 @@ class _StudentScreenState extends State<StudentScreen> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               FilledButton.icon(
-                onPressed: (j != null && j.running) ? null : () => startQuick(),
+                onPressed: _busy ? null : () => startQuick(),
                 icon: const Icon(Icons.play_arrow),
                 label: const Text('Start fine-tuning'),
               ),
@@ -623,16 +591,13 @@ class _StudentScreenState extends State<StudentScreen> {
               if (j != null && j.running)
                 OutlinedButton.icon(
                   onPressed: () => r.stop(j),
-                  icon: const Icon(
-                    Icons.stop_circle_outlined,
-                    color: Colors.redAccent,
-                  ),
+                  icon: const Icon(Icons.stop_circle_outlined, color: Colors.redAccent),
                   label: const Text('Stop'),
                 ),
             ],
           ),
-          if (msg != null)
-            Padding(padding: const EdgeInsets.only(top: 8), child: Text(msg!)),
+          if (msg != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(msg!)),
+          _downloads(),
         ],
       ),
     ];
