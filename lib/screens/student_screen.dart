@@ -652,7 +652,8 @@ class _StudentScreenState extends State<StudentScreen> {
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            modeToggle,
+            // modeToggle hidden for now: the Advanced (recipes & folds) tab is ignored for students.
+            // To bring it back, restore `modeToggle,` here.
             if (quick)
               ..._quickSections()
             else ...[
