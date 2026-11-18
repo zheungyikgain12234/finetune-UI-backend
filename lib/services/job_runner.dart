@@ -98,17 +98,29 @@ class JobRunner extends ChangeNotifier {
     }
   }
 
-  Future<List<Fold>> folds(String path) async {
+  Future<List<Fold>> folds(String path, {String marker = 'outputs'}) async {
     if (path.trim().isEmpty) return [];
     try {
       final r = await http.get(
         Uri.parse('$base/api/folds')
-            .replace(queryParameters: {'path': path.trim()}),
+            .replace(queryParameters: {'path': path.trim(), 'marker': marker}),
       );
       return [for (final f in jsonDecode(r.body)) Fold(f)];
     } catch (_) {
       return [];
     }
+  }
+
+  /// Prompt presets (scripts/prompts/*.txt) as [{name, text}].
+  Future<List<Map<String, dynamic>>> prompts() async {
+    final r = await http.get(Uri.parse('$base/api/prompts'));
+    return List<Map<String, dynamic>>.from(jsonDecode(r.body));
+  }
+
+  /// Training recipes (scripts/recipes/*.json): student model, hyper-parameters and command templates.
+  Future<List<Map<String, dynamic>>> recipes() async {
+    final r = await http.get(Uri.parse('$base/api/recipes'));
+    return List<Map<String, dynamic>>.from(jsonDecode(r.body));
   }
 
   Future<Map<String, dynamic>> ls(String path) async {
@@ -137,6 +149,26 @@ class JobRunner extends ChangeNotifier {
       Uri.parse('$base/api/test-connection'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'url': url, 'key': key, 'model': model}),
+    );
+    return jsonDecode(r.body);
+  }
+
+  /// Checks a Hugging Face model id (or local folder). Returns {ok, info|error}.
+  Future<Map<String, dynamic>> testHfModel(String model) async {
+    final r = await http.post(
+      Uri.parse('$base/api/test-hf-model'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'model': model}),
+    );
+    return jsonDecode(r.body);
+  }
+
+  /// Health check + agent card (name, capability, input fields) of a BYOA/ADK agent.
+  Future<Map<String, dynamic>> agentCard(String url) async {
+    final r = await http.post(
+      Uri.parse('$base/api/agent-card'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'url': url}),
     );
     return jsonDecode(r.body);
   }

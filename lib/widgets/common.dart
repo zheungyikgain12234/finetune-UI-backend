@@ -153,7 +153,7 @@ class _FolderPickerDialogState extends State<FolderPickerDialog> {
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 6),
                 child: Text(
-                  '${d!['pdfs']} PDF(s), ${d!['mds']} .md file(s) in this folder',
+                  '${d!['pdfs']} PDF/image file(s), ${d!['mds']} .md file(s) in this folder',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),

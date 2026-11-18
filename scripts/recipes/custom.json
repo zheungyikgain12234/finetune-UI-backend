@@ -1,0 +1,13 @@
+{
+  "name": "Custom (write your own commands)",
+  "description": "Blank recipe. Fill in the three command templates; add hyper-parameters as needed.",
+  "student": "",
+  "params": {
+    "epochs": "3",
+    "lr": "1e-4"
+  },
+  "doneMarker": "outputs",
+  "buildCmd": "",
+  "trainCmd": "",
+  "inferCmd": ""
+}

@@ -4,13 +4,13 @@ import 'screens/student_screen.dart';
 import 'screens/teacher_screen.dart';
 import 'services/job_runner.dart';
 
-void main() => runApp(const OvisFtApp());
+void main() => runApp(const FinetuneApp());
 
-class OvisFtApp extends StatelessWidget {
-  const OvisFtApp({super.key});
+class FinetuneApp extends StatelessWidget {
+  const FinetuneApp({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'Ovis Fine-tune',
+    title: 'Fine-tune Studio',
     theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
     darkTheme: ThemeData(
       colorSchemeSeed: Colors.indigo,
@@ -39,7 +39,7 @@ class _HomeState extends State<Home> {
     ];
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Ovis fine-tune'),
+        title: const Text('Fine-tune Studio'),
         actions: [
           Padding(
             padding: const EdgeInsets.only(right: 16),

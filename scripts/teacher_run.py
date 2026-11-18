@@ -1,7 +1,9 @@
-"""Teacher OCR over a folder of PDFs -> one <stem>.md each. Mirrors ~/qwen-vl/batch_convert.py:
-same prompt (scripts/teacher_prompt.txt, copied verbatim), one page per request, temperature 0, thinking off,
-continuation-row merge, <think>/auto-link cleanup, <!-- page N --> markers, flagged.txt for failures/truncation.
-Works with any OpenAI-compatible endpoint. API key comes from the TEACHER_API_KEY env var."""
+"""Teacher run: send every PDF page / image in a folder to a vision-language model behind any OpenAI-compatible
+endpoint and write one <stem>.<ext> label file per input (default .md). One page per request, temperature 0.
+The prompt comes from the TEACHER_PROMPT env var, else --prompt-file. Post-processing is optional:
+  --postprocess markdown : merge table continuation rows, strip <think>/auto-links, add <!-- page N --> markers
+  --postprocess none     : raw model text (only <think> blocks removed)
+Failures and truncated outputs are listed in flagged.txt. API key comes from the TEACHER_API_KEY env var."""
 import argparse, base64, json, os, re, sys, time, urllib.error, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -42,19 +44,27 @@ def merge_continuation_rows(md):
     return "\n".join(out)
 
 
-def render_pages(pdf, dpi):
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+
+def render_pages(path, dpi):
+    """PDF -> one PNG per page; image file -> itself. Returns list of (bytes, mime)."""
+    if path.suffix.lower() in IMAGE_EXT:
+        mime = {".jpg": "jpeg", ".jpeg": "jpeg", ".tif": "tiff"}.get(path.suffix.lower(), path.suffix.lower()[1:])
+        return [(path.read_bytes(), f"image/{mime}")]
     import pymupdf
-    doc = pymupdf.open(pdf)
+    doc = pymupdf.open(path)
     try:
-        return [p.get_pixmap(dpi=dpi).tobytes("png") for p in doc]
+        return [(p.get_pixmap(dpi=dpi).tobytes("png"), "image/png") for p in doc]
     finally:
         doc.close()
 
 
-def ask(a, key, prompt, png):
+def ask(a, key, prompt, img):
+    png, mime = img
     body = {"model": a.model, "max_tokens": a.max_tokens, "temperature": 0,
             "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64," + base64.b64encode(png).decode()}},
                 {"type": "text", "text": prompt}]}]}
     if not a.allow_thinking:
         body["chat_template_kwargs"] = {"enable_thinking": False}
@@ -76,19 +86,21 @@ def ask(a, key, prompt, png):
 
 def convert(a, key, prompt, pdf, out):
     parts, cut = [], False
-    for png in render_pages(pdf, a.dpi):
-        md, c = ask(a, key, prompt, png)
+    for img in render_pages(pdf, a.dpi):
+        md, c = ask(a, key, prompt, img)
         cut = cut or c
         parts.append(md)
     if not parts or any(not x.strip() for x in parts):
         raise RuntimeError("empty or missing page output")
-    parts = [merge_continuation_rows(x) for x in parts]
-    md = "\n\n---\n\n".join(f"<!-- page {i+1} -->\n{x}" for i, x in enumerate(parts)) if len(parts) > 1 \
-        else parts[0]
+    md_mode = a.postprocess == "markdown"
+    if md_mode:
+        parts = [merge_continuation_rows(x) for x in parts]
+        md = "\n\n---\n\n".join(f"<!-- page {i+1} -->\n{x}" for i, x in enumerate(parts))
+    else:
+        md = "\n\n".join(parts)
     md = re.sub(r"<think>.*?</think>", "", md, flags=re.S).strip()
-    md = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", md)   # remove auto-links
-    if len(parts) == 1:
-        md = f"<!-- page 1 -->\n{md}"
+    if md_mode:
+        md = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", md)   # remove auto-links
     out.write_text(md, encoding="utf-8")
     return len(parts), cut
 
@@ -99,7 +111,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--prompt-file", default=str(HERE / "teacher_prompt.txt"))
+    ap.add_argument("--prompt-file", help="used when the TEACHER_PROMPT env var is empty")
+    ap.add_argument("--postprocess", choices=["markdown", "none"], default="markdown")
+    ap.add_argument("--ext", default="md", help="label file extension")
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--workers", type=int, default=2)
@@ -109,17 +123,19 @@ def main():
     ap.add_argument("--allow-thinking", action="store_true", help="do not send enable_thinking=false")
     a = ap.parse_args()
     key = os.environ.get("TEACHER_API_KEY", "")
-    prompt = Path(a.prompt_file).read_text().strip()
+    prompt = (os.environ.get("TEACHER_PROMPT") or (Path(a.prompt_file).read_text() if a.prompt_file else "")).strip()
+    if not prompt:
+        sys.exit("no prompt given (set the prompt in the UI or pass --prompt-file)")
     src, dst = Path(a.src).expanduser().resolve(), Path(a.out).expanduser().resolve()
     dst.mkdir(parents=True, exist_ok=True)
-    pdfs = sorted(p for p in src.rglob("*") if p.suffix.lower() == ".pdf")
+    pdfs = sorted(p for p in src.rglob("*") if p.suffix.lower() == ".pdf" or p.suffix.lower() in IMAGE_EXT)
     if a.limit:
         pdfs = pdfs[:a.limit]
-    print(f"Found {len(pdfs)} PDF(s). Output: {dst}", flush=True)
+    print(f"Found {len(pdfs)} input file(s). Output: {dst}", flush=True)
     flagged = []
 
     def work(pdf):
-        out = dst / pdf.relative_to(src).with_suffix(".md")
+        out = dst / pdf.relative_to(src).with_suffix("." + a.ext.lstrip("."))
         if out.exists():
             return pdf, "skipped", None
         out.parent.mkdir(parents=True, exist_ok=True)

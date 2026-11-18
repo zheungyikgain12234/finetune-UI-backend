@@ -1,0 +1,15 @@
+{
+  "name": "Ovis OCR (LoRA)",
+  "description": "Document-image to Markdown with Ovis OCR, LoRA fine-tune, then inference on each fold's held-out files.",
+  "student": "ATH-MaaS/OvisOCR2",
+  "params": {
+    "epochs": "30",
+    "lr": "1e-4",
+    "rank": "32",
+    "max_new": "8192"
+  },
+  "doneMarker": "outputs/merged_16bit",
+  "buildCmd": "python3 build_dataset.py {source_dir} {labels_dir} --out {out} --test-list {test_list}",
+  "trainCmd": "python3 train_ovis.py --data {data} --model {model} --epochs {epochs} --lr {lr} --rank {rank} --out {outputs}",
+  "inferCmd": "python3 ocr_folder.py {test_inputs} --out {predictions} --model {outputs}/merged_16bit --data {data} --max-new {max_new}"
+}
