@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../services/job_runner.dart';
@@ -328,4 +329,72 @@ void showLogDialog(BuildContext context, JobRunner runner, Job job) {
       ),
     ),
   );
+}
+
+
+/// Upload one .zip into a workspace slot on the server. `info` is that slot's entry from the workspace status.
+class ZipUploadTile extends StatefulWidget {
+  const ZipUploadTile({
+    super.key,
+    required this.runner,
+    required this.slot,
+    required this.title,
+    required this.hint,
+    required this.info,
+    required this.onDone,
+  });
+  final JobRunner runner;
+  final String slot, title, hint;
+  final Map? info;
+  final VoidCallback onDone;
+  @override
+  State<ZipUploadTile> createState() => _ZipUploadTileState();
+}
+
+class _ZipUploadTileState extends State<ZipUploadTile> {
+  bool busy = false;
+  String? msg;
+
+  Future<void> pick() async {
+    try {
+      final f = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: ['zip'],
+        dialogTitle: 'Choose a .zip',
+      );
+      if (f == null) return;
+      setState(() {
+        busy = true;
+        msg = null;
+      });
+      final res = await widget.runner.uploadZip(widget.slot, await f.readAsBytes());
+      msg =
+          '${f.name}: ${res['files']} file(s)${res['skipped'] > 0 ? ', ${res['skipped']} skipped (unsupported or unsafe)' : ''}';
+      widget.onDone();
+    } catch (e) {
+      msg = 'Upload failed: $e';
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final info = widget.info;
+    final types = info == null ? '' : (info['types'] as Map).entries.map((e) => '${e.value}× ${e.key}').join(', ');
+    return ListTile(
+      dense: true,
+      contentPadding: EdgeInsets.zero,
+      leading: Icon(info != null ? Icons.check_circle : Icons.upload_file, color: info != null ? Colors.green : null),
+      title: Text(widget.title),
+      subtitle: Text(msg ?? (info != null ? 'Uploaded: ${info['files']} file(s) ($types)' : widget.hint)),
+      trailing: OutlinedButton.icon(
+        onPressed: busy ? null : pick,
+        icon: busy
+            ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+            : const Icon(Icons.folder_zip_outlined),
+        label: Text(info != null ? 'Replace .zip' : 'Choose .zip'),
+      ),
+    );
+  }
 }

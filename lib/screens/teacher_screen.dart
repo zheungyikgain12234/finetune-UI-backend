@@ -2,22 +2,9 @@ import 'package:flutter/material.dart';
 
 import '../services/job_runner.dart';
 import '../widgets/common.dart';
-import 'agent_form.dart';
 
-class _Preset {
-  const _Preset(this.name, this.url, this.needsKey);
-  final String name, url;
-  final bool needsKey;
-}
-
-const _presets = [
-  _Preset('Local vLLM', 'http://localhost:8000/v1', false),
-  _Preset('OpenAI', 'https://api.openai.com/v1', true),
-  _Preset('OpenRouter', 'https://openrouter.ai/api/v1', true),
-  _Preset('Anthropic (OpenAI-compat)', 'https://api.anthropic.com/v1', true),
-  _Preset('Custom', '', false),
-];
-
+/// Teacher: label your files with a model or agent that the server offers, then download the labels
+/// or hand them to the Student tab. Nothing here names a server path, URL or key.
 class TeacherScreen extends StatefulWidget {
   const TeacherScreen({super.key, required this.runner});
   final JobRunner runner;
@@ -26,95 +13,91 @@ class TeacherScreen extends StatefulWidget {
 }
 
 class _TeacherScreenState extends State<TeacherScreen> {
-  _Preset preset = _presets.first;
-  final url = TextEditingController(text: _presets.first.url);
-  final key = TextEditingController();
-  final model = TextEditingController();
-  final input = TextEditingController();
-  final output = TextEditingController();
-  final prompt = TextEditingController();
-  final dpi = TextEditingController(text: '200');
-  final maxTok = TextEditingController(text: '8192');
-  final workers = TextEditingController(text: '2');
-  bool disableThinking = true;
-  bool markdownPost = true;
-  int mode = 0; // 0 = model, 1 = agent
+  int mode = 0; // 0 = model (images / PDFs), 1 = agent (text in, JSON out)
+  List<Map<String, dynamic>> teachers = [];
+  String? teacherId;
   List<Map<String, dynamic>> promptPresets = [];
   String? promptPreset;
-  List<String> models = [];
-  String? msg;
-  bool fetching = false;
-  bool testing = false;
+  final prompt = TextEditingController();
+  final fields = TextEditingController();
+  final instructions = TextEditingController();
+  final dpi = TextEditingController(text: '200');
+  final maxTok = TextEditingController(text: '8192');
+  final timeout = TextEditingController(text: '600');
+  bool markdownPost = true;
+  bool thinking = false;
+  Map<String, dynamic> ws = {};
   Map<String, dynamic>? testResult;
+  bool testing = false;
+  String? msg;
 
   JobRunner get r => widget.runner;
+  String get jobName => 'ws:${r.wid}:teacher';
+  List<Map<String, dynamic>> get options => [
+    for (final t in teachers)
+      if (t['kind'] == (mode == 0 ? 'model' : 'agent')) t,
+  ];
+  Map<String, dynamic>? get teacher {
+    for (final t in options) {
+      if (t['id'] == teacherId) return t;
+    }
+    return null;
+  }
 
   @override
   void initState() {
     super.initState();
-    loadPrompts();
-    r.addListener(_retryPrompts);
+    _load();
+    r.addListener(_onRunner);
   }
 
   @override
   void dispose() {
-    r.removeListener(_retryPrompts);
+    r.removeListener(_onRunner);
     super.dispose();
   }
 
-  void _retryPrompts() {
-    if (promptPresets.isEmpty && r.error == null) loadPrompts();
+  void _onRunner() {
+    if (teachers.isEmpty && r.error == null) _load();
+    _refreshWs();
   }
 
-  Future<void> loadPrompts() async {
+  Future<void> _load() async {
     try {
-      final l = await r.prompts();
+      final t = await r.teachers();
+      final p = await r.prompts();
       if (!mounted) return;
       setState(() {
-        promptPresets = l;
-        if (promptPreset == null && l.isNotEmpty && prompt.text.isEmpty) {
-          promptPreset = l.first['name'];
-          prompt.text = l.first['text'];
+        teachers = t;
+        promptPresets = p;
+        if (teacherId == null && options.isNotEmpty) teacherId = options.first['id'];
+        if (promptPreset == null && p.isNotEmpty && prompt.text.isEmpty) {
+          promptPreset = p.first['name'];
+          prompt.text = p.first['text'];
         }
       });
     } catch (_) {}
   }
 
-  Future<void> fetchModels() async {
-    setState(() {
-      fetching = true;
-      msg = null;
-    });
+  Future<void> _refreshWs() async {
+    if (r.wid.isEmpty || r.error != null) return;
     try {
-      final ids = await r.listModels(url.text.trim(), key.text.trim());
-      setState(() {
-        models = ids;
-        if (ids.isNotEmpty && model.text.isEmpty) model.text = ids.first;
-        msg = 'Found ${ids.length} model(s).';
-      });
-    } catch (e) {
-      setState(() => msg = 'Could not list models: $e');
-    } finally {
-      setState(() => fetching = false);
-    }
+      final w = await r.wsStatus();
+      if (mounted) setState(() => ws = w);
+    } catch (_) {}
   }
 
-  Future<void> testConn() async {
+  Future<void> test() async {
+    if (teacherId == null) return;
     setState(() {
       testing = true;
       testResult = null;
     });
     Map<String, dynamic> res;
     try {
-      if (url.text.trim().isEmpty || model.text.trim().isEmpty)
-        throw 'Fill in Base URL and Model name first.';
-      res = await r.testConnection(
-        url.text.trim(),
-        key.text.trim(),
-        model.text.trim(),
-      );
+      res = await r.teacherTest(teacherId!);
     } catch (e) {
-      res = {'ok': false, 'error': '$e'};
+      res = {'ok': false, 'info': 'Could not reach the backend: $e'};
     }
     if (mounted) {
       setState(() {
@@ -125,30 +108,87 @@ class _TeacherScreenState extends State<TeacherScreen> {
   }
 
   Future<void> run() async {
-    if (prompt.text.trim().isEmpty) {
+    if (teacherId == null) {
+      setState(() => msg = 'Pick a teacher first.');
+      return;
+    }
+    if (mode == 0 && prompt.text.trim().isEmpty) {
       setState(() => msg = 'Write or pick a prompt first.');
       return;
     }
-    if ([url, model, input, output].any((c) => c.text.trim().isEmpty)) {
-      setState(
-        () => msg = 'Fill in URL, model, input folder and output folder.',
-      );
+    if ((ws['slots'] as Map?)?['teacher_inputs'] == null) {
+      setState(() => msg = 'Upload the input files (.zip) first.');
       return;
     }
-    final script = '${r.root}/ovis_ft_ui/scripts/teacher_run.py';
-    final cmd =
-        'python3 ${shq(script)} ${shq(input.text.trim())} --out ${shq(output.text.trim())} '
-        '--base-url ${shq(url.text.trim())} --model ${shq(model.text.trim())} '
-        '--dpi ${int.tryParse(dpi.text) ?? 200} --max-tokens ${int.tryParse(maxTok.text) ?? 8192} --workers ${int.tryParse(workers.text) ?? 2}${disableThinking ? '' : ' --allow-thinking'} --postprocess ${markdownPost ? 'markdown' : 'none'}';
-    final job = await r.start(
-      'teacher',
-      cmd,
-      env: {
-        'TEACHER_API_KEY': key.text.trim(),
-        'TEACHER_PROMPT': prompt.text.trim(),
-      },
+    try {
+      await r.teacherRun({
+        'teacher': teacherId,
+        if (mode == 0) ...{
+          'prompt': prompt.text.trim(),
+          'dpi': int.tryParse(dpi.text) ?? 200,
+          'max_tokens': int.tryParse(maxTok.text) ?? 8192,
+          'markdown': markdownPost,
+          'thinking': thinking,
+        } else ...{
+          'fields': fields.text.trim(),
+          'instructions': instructions.text.trim(),
+          'timeout': int.tryParse(timeout.text) ?? 600,
+        },
+      });
+      setState(() => msg = 'Started. Logs appear on the right.');
+    } catch (e) {
+      setState(() => msg = '$e');
+    }
+  }
+
+  Future<void> useForStudent() async {
+    try {
+      await r.useTeacherLabels();
+      await _refreshWs();
+      setState(
+        () => msg = 'Done. Open the Student tab: the inputs and labels are already filled in with these files.',
+      );
+    } catch (e) {
+      setState(() => msg = '$e');
+    }
+  }
+
+  Widget _downloads() {
+    final t = ws['teacher'] as Map?;
+    if (t == null) return const SizedBox.shrink();
+    return Card(
+      margin: const EdgeInsets.only(top: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Labels', style: Theme.of(context).textTheme.titleSmall),
+            Text(
+              '${t['files']} label file(s) written'
+              '${(t['flagged'] ?? 0) > 0 ? ', ${t['flagged']} flagged (see flagged.txt in the zip)' : ''}.',
+            ),
+            gap(8),
+            Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: () => r.download('teacher'),
+                  icon: const Icon(Icons.download),
+                  label: Text('Download labels (${t['mb']} MB)'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: useForStudent,
+                  icon: const Icon(Icons.school_outlined),
+                  label: const Text('Use as training data for Student'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
-    setState(() => msg = 'Started in background (job ${job.id}).');
   }
 
   @override
@@ -156,7 +196,10 @@ class _TeacherScreenState extends State<TeacherScreen> {
     return AnimatedBuilder(
       animation: r,
       builder: (context, _) {
-        final job = r.byName('teacher');
+        final job = r.byName(jobName);
+        final t = teacher;
+        final slot = (ws['slots'] as Map?)?['teacher_inputs'] as Map?;
+        final notReady = t != null && t['configured'] == false;
         return Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -179,122 +222,77 @@ class _TeacherScreenState extends State<TeacherScreen> {
                       ),
                     ],
                     selected: {mode},
-                    onSelectionChanged: (v) => setState(() => mode = v.first),
+                    onSelectionChanged: (v) => setState(() {
+                      mode = v.first;
+                      teacherId = options.isNotEmpty ? options.first['id'] : null;
+                      testResult = null;
+                      msg = null;
+                    }),
                   ),
                   gap(),
-                  if (mode == 1) AgentForm(runner: r),
-                  if (mode == 0) ...[
-                    Section(
-                      '1. Teacher model',
-                      children: [
-                        DropdownButtonFormField<_Preset>(
-                          initialValue: preset,
-                          decoration: const InputDecoration(
-                            labelText: 'Provider',
-                            border: OutlineInputBorder(),
-                          ),
-                          items: [
-                            for (final p in _presets)
-                              DropdownMenuItem(value: p, child: Text(p.name)),
-                          ],
-                          onChanged: (p) => setState(() {
-                            preset = p!;
-                            if (p.url.isNotEmpty) url.text = p.url;
-                            models = [];
-                          }),
+                  Section(
+                    '1. Teacher',
+                    children: [
+                      DropdownButtonFormField<String>(
+                        key: ValueKey('$mode-${teachers.length}'),
+                        initialValue: teacherId,
+                        isExpanded: true,
+                        decoration: InputDecoration(
+                          labelText: mode == 0 ? 'Model' : 'Agent',
+                          helperText: teachers.isEmpty
+                              ? 'Loading the list from the server…'
+                              : (t?['note'] as String?),
+                          border: const OutlineInputBorder(),
                         ),
-                        gap(),
-                        TextField(
-                          controller: url,
-                          decoration: const InputDecoration(
-                            labelText:
-                                'Base URL (OpenAI-compatible, ends in /v1)',
-                            border: OutlineInputBorder(),
-                          ),
-                        ),
-                        gap(),
-                        TextField(
-                          controller: key,
-                          obscureText: true,
-                          decoration: InputDecoration(
-                            labelText:
-                                'API key${preset.needsKey ? '' : ' (optional for local vLLM)'}',
-                            helperText: 'Passed to the job via environment only; never saved.',
-                            border: const OutlineInputBorder(),
+                        items: [
+                          for (final o in options)
+                            DropdownMenuItem(
+                              value: o['id'] as String,
+                              child: Text('${o['label']}'),
+                            ),
+                        ],
+                        onChanged: (v) => setState(() {
+                          teacherId = v;
+                          testResult = null;
+                        }),
+                      ),
+                      if (notReady)
+                        const Padding(
+                          padding: EdgeInsets.only(top: 8),
+                          child: Text(
+                            'This teacher is not configured on the server yet, so it cannot run.',
+                            style: TextStyle(color: Colors.redAccent),
                           ),
                         ),
-                        gap(),
-                        Row(
-                          children: [
+                      gap(),
+                      Row(
+                        children: [
+                          FilledButton.icon(
+                            onPressed: (testing || teacherId == null) ? null : test,
+                            icon: testing
+                                ? const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  )
+                                : const Icon(Icons.wifi_tethering),
+                            label: Text(mode == 0 ? 'Test connection (hello world)' : 'Test agent (health + card)'),
+                          ),
+                          gap(),
+                          if (testResult != null)
                             Expanded(
-                              child: TextField(
-                                controller: model,
-                                decoration: InputDecoration(
-                                  labelText: 'Model name',
-                                  border: const OutlineInputBorder(),
-                                  suffixIcon: models.isEmpty
-                                      ? null
-                                      : PopupMenuButton<String>(
-                                          icon: const Icon(
-                                            Icons.arrow_drop_down,
-                                          ),
-                                          onSelected: (m) =>
-                                              setState(() => model.text = m),
-                                          itemBuilder: (_) => [
-                                            for (final m in models)
-                                              PopupMenuItem(
-                                                value: m,
-                                                child: Text(m),
-                                              ),
-                                          ],
-                                        ),
+                              child: Text(
+                                '${testResult!['ok'] == true ? '✓' : '✗'} ${testResult!['info'] ?? testResult!['error']}',
+                                style: TextStyle(
+                                  color: testResult!['ok'] == true ? Colors.green : Colors.redAccent,
                                 ),
                               ),
                             ),
-                            const SizedBox(width: 8),
-                            FilledButton.tonalIcon(
-                              onPressed: fetching ? null : fetchModels,
-                              icon: const Icon(Icons.cloud_download_outlined),
-                              label: const Text('Fetch models'),
-                            ),
-                          ],
-                        ),
-                        gap(),
-                        Row(
-                          children: [
-                            FilledButton.icon(
-                              onPressed: testing ? null : testConn,
-                              icon: testing
-                                  ? const SizedBox(
-                                      width: 16,
-                                      height: 16,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    )
-                                  : const Icon(Icons.wifi_tethering),
-                              label: const Text(
-                                'Test connection (hello world)',
-                              ),
-                            ),
-                            gap(),
-                            if (testResult != null)
-                              Expanded(
-                                child: Text(
-                                  testResult!['ok'] == true
-                                      ? '✓ Connected in ${testResult!['ms']} ms. Model replied: "${('${testResult!['reply'] ?? ''}').trim()}"'
-                                      : '✗ ${testResult!['error']}',
-                                  style: TextStyle(
-                                    color: testResult!['ok'] == true
-                                        ? Colors.green
-                                        : Colors.redAccent,
-                                  ),
-                                ),
-                              ),
-                          ],
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  if (mode == 0)
                     Section(
                       '2. Prompt',
                       children: [
@@ -302,21 +300,16 @@ class _TeacherScreenState extends State<TeacherScreen> {
                           key: ValueKey(promptPresets.length),
                           initialValue: promptPreset,
                           decoration: const InputDecoration(
-                            labelText: 'Preset (editable below; add your own in scripts/prompts/*.txt)',
+                            labelText: 'Preset (editable below)',
                             border: OutlineInputBorder(),
                           ),
                           items: [
                             for (final p in promptPresets)
-                              DropdownMenuItem(
-                                value: p['name'] as String,
-                                child: Text(p['name']),
-                              ),
+                              DropdownMenuItem(value: p['name'] as String, child: Text(p['name'])),
                           ],
                           onChanged: (n) => setState(() {
                             promptPreset = n;
-                            prompt.text = promptPresets.firstWhere(
-                              (p) => p['name'] == n,
-                            )['text'];
+                            prompt.text = promptPresets.firstWhere((p) => p['name'] == n)['text'];
                           }),
                         ),
                         gap(),
@@ -331,26 +324,58 @@ class _TeacherScreenState extends State<TeacherScreen> {
                           ),
                         ),
                       ],
-                    ),
+                    )
+                  else
                     Section(
-                      '3. Input & output',
+                      '2. What to save',
                       children: [
-                        FolderField(
-                          runner: r,
-                          label: 'Input folder (PDFs or images, searched recursively)',
-                          controller: input,
+                        TextField(
+                          controller: fields,
+                          minLines: 3,
+                          maxLines: 8,
+                          decoration: const InputDecoration(
+                            labelText: 'Parts to keep (comma or one per line). Empty = save the FULL agent response',
+                            helperText:
+                                'Paths start at the top of the saved response, e.g.  response.outputs.structured  '
+                                '(only the extracted JSON).  A bare name like  document_number, line_items.description  '
+                                'is searched inside it and also sent to the agent as what to extract.',
+                            helperMaxLines: 4,
+                            alignLabelWithHint: true,
+                            border: OutlineInputBorder(),
+                          ),
                         ),
                         gap(),
-                        FolderField(
-                          runner: r,
-                          label: 'Output folder (one label file per input)',
-                          controller: output,
+                        TextField(
+                          controller: instructions,
+                          minLines: 2,
+                          maxLines: 5,
+                          decoration: const InputDecoration(
+                            labelText: 'Extra instructions for the agent (optional)',
+                            alignLabelWithHint: true,
+                            border: OutlineInputBorder(),
+                          ),
                         ),
-                        ExpansionTile(
-                          tilePadding: EdgeInsets.zero,
-                          title: const Text('Advanced'),
-                          childrenPadding: const EdgeInsets.only(bottom: 8),
-                          children: [
+                      ],
+                    ),
+                  Section(
+                    '3. Files',
+                    children: [
+                      ZipUploadTile(
+                        runner: r,
+                        slot: 'teacher_inputs',
+                        title: 'Input files (.zip)',
+                        hint: mode == 0
+                            ? 'PDFs or images (searched recursively).'
+                            : 'Markdown / text files (.md), searched recursively.',
+                        info: slot,
+                        onDone: _refreshWs,
+                      ),
+                      ExpansionTile(
+                        tilePadding: EdgeInsets.zero,
+                        title: const Text('Advanced'),
+                        childrenPadding: const EdgeInsets.only(bottom: 8),
+                        children: [
+                          if (mode == 0) ...[
                             Row(
                               children: [
                                 Expanded(
@@ -372,63 +397,60 @@ class _TeacherScreenState extends State<TeacherScreen> {
                                     ),
                                   ),
                                 ),
-                                gap(),
-                                Expanded(
-                                  child: TextField(
-                                    controller: workers,
-                                    decoration: const InputDecoration(
-                                      labelText: 'Parallel workers',
-                                      border: OutlineInputBorder(),
-                                    ),
-                                  ),
-                                ),
                               ],
                             ),
                             CheckboxListTile(
                               dense: true,
                               contentPadding: EdgeInsets.zero,
-                              value: disableThinking,
-                              onChanged: (v) =>
-                                  setState(() => disableThinking = v ?? true),
-                              title: const Text(
-                                'Disable thinking (sends enable_thinking=false; vLLM/Qwen3 only)',
-                              ),
+                              value: !thinking,
+                              onChanged: (v) => setState(() => thinking = !(v ?? true)),
+                              title: const Text('Disable thinking (sends enable_thinking=false; vLLM/Qwen3 only)'),
                             ),
                             CheckboxListTile(
                               dense: true,
                               contentPadding: EdgeInsets.zero,
                               value: markdownPost,
-                              onChanged: (v) =>
-                                  setState(() => markdownPost = v ?? true),
-                              title: const Text(
-                                'Markdown clean-up (merge table rows, strip links, add page markers)',
-                              ),
-                              subtitle: const Text(
-                                'Turn off for non-document tasks to keep the raw model text.',
+                              onChanged: (v) => setState(() => markdownPost = v ?? true),
+                              title: const Text('Markdown clean-up (merge table rows, strip links, add page markers)'),
+                              subtitle: const Text('Turn off for non-document tasks to keep the raw model text.'),
+                            ),
+                          ] else
+                            TextField(
+                              controller: timeout,
+                              decoration: const InputDecoration(
+                                labelText: 'Timeout per file (s)',
+                                border: OutlineInputBorder(),
                               ),
                             ),
-                          ],
-                        ),
-                        gap(),
-                        Row(
-                          children: [
-                            FilledButton.icon(
-                              onPressed: r.isRunning('teacher') ? null : run,
-                              icon: const Icon(Icons.play_arrow),
-                              label: const Text('Run teacher in background'),
+                        ],
+                      ),
+                      gap(),
+                      Row(
+                        children: [
+                          FilledButton.icon(
+                            onPressed: (job != null && job.running) || notReady ? null : run,
+                            icon: const Icon(Icons.play_arrow),
+                            label: const Text('Run teacher in background'),
+                          ),
+                          gap(),
+                          if (job != null && job.running)
+                            OutlinedButton.icon(
+                              onPressed: () => r.stop(job),
+                              icon: const Icon(Icons.stop_circle_outlined, color: Colors.redAccent),
+                              label: const Text('Stop'),
                             ),
-                            gap(),
-                            if (msg != null) Expanded(child: Text(msg!)),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        const Text(
-                          'Already-finished files in the output folder are skipped, so re-running resumes.',
-                          style: TextStyle(fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  ],
+                          gap(),
+                          if (msg != null) Expanded(child: Text(msg!)),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      const Text(
+                        'Each run starts fresh: the previous labels in your workspace are replaced.',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                      _downloads(),
+                    ],
+                  ),
                 ],
               ),
             ),
@@ -437,11 +459,7 @@ class _TeacherScreenState extends State<TeacherScreen> {
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(0, 16, 16, 16),
                 child: job == null
-                    ? const Center(
-                        child: Text(
-                          'No teacher job yet. Logs will appear here.',
-                        ),
-                      )
+                    ? const Center(child: Text('No teacher job yet. Logs will appear here.'))
                     : LogViewer(runner: r, job: job),
               ),
             ),

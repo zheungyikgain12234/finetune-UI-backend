@@ -116,7 +116,43 @@ class JobRunner extends ChangeNotifier {
     await refresh();
   }
 
-  /// Opens the download in the browser: what = 'lora' (small adapter) or 'merged' (full model, about 16 GB).
+  // ---- Teacher: allowlisted models/agents on the server (no URLs or keys in the browser) ----
+
+  /// [{id, kind: model|agent, label, vision, configured, note}]
+  Future<List<Map<String, dynamic>>> teachers() async {
+    final r = await _c.get(Uri.parse('$base/api/teachers'));
+    return List<Map<String, dynamic>>.from(jsonDecode(r.body));
+  }
+
+  Future<Map<String, dynamic>> teacherTest(String id) async {
+    final r = await _c.post(
+      Uri.parse('$base/api/ws/$wid/teacher/test'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'teacher': id}),
+    );
+    return jsonDecode(r.body);
+  }
+
+  /// `p`: teacher, and for a model: prompt, dpi, max_tokens, markdown, thinking; for an agent: fields, instructions, timeout.
+  Future<void> teacherRun(Map<String, dynamic> p) async {
+    final r = await _c.post(
+      Uri.parse('$base/api/ws/$wid/teacher/run'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode(p),
+    );
+    final b = jsonDecode(r.body);
+    if (r.statusCode != 200) throw b['error'] ?? r.body;
+    await refresh();
+  }
+
+  /// Copies the teacher's inputs and labels into the Student's inputs and labels.
+  Future<void> useTeacherLabels() async {
+    final r = await _c.post(Uri.parse('$base/api/ws/$wid/teacher/use-labels'), body: '{}');
+    final b = jsonDecode(r.body);
+    if (r.statusCode != 200) throw b['error'] ?? r.body;
+  }
+
+  /// Opens the download in the browser: what = 'lora' (small adapter), 'merged' (full model, about 16 GB) or 'teacher' (label files).
   Future<bool> download(String what) =>
       launchUrl(Uri.parse('$base/api/ws/$wid/download?what=$what'), mode: LaunchMode.externalApplication);
 

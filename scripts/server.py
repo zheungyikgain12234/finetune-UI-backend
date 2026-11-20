@@ -20,10 +20,12 @@ MAX_UNZIPPED = int(os.environ.get("FT_MAX_UNZIPPED_MB", "2000")) * 2**20
 MAX_FILES = 20000
 TEXT_EXT = {".md", ".txt", ".json", ".csv", ".html", ".xml", ".yaml", ".yml", ".tsv", ".log"}
 UPLOAD_EXT = TEXT_EXT | {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".pdf"}
-SLOTS = ("inputs", "labels", "test_inputs", "test_labels")
+SLOTS = ("inputs", "labels", "test_inputs", "test_labels", "teacher_inputs")
 STEPS = ("all", "check", "build", "check-train", "check-infer")
 WID_RE = re.compile(r"[a-f0-9]{32}")
 ALLOWED_FILE = Path(__file__).with_name("allowed_models.json")
+TEACHERS_FILE = Path(os.environ.get("FT_TEACHERS_FILE") or Path(__file__).with_name("teachers.json"))
+TEACHER_MAX_FILES = int(os.environ.get("FT_TEACHER_MAX_FILES", "300"))
 
 
 def load():
@@ -108,6 +110,121 @@ def allowed_models():
         return []
 
 
+def teachers():
+    try:
+        return json.loads(TEACHERS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def teacher_public(t):
+    """What browsers may see about a teacher: never its URL or key."""
+    env = t.get("secret_env") if t["kind"] == "agent" else t.get("key_env")
+    return {"id": t["id"], "kind": t["kind"], "label": t.get("label", t["id"]), "vision": bool(t.get("vision")),
+            "configured": bool(os.environ.get(env)) if env else True, "note": t.get("note")}
+
+
+def get_teacher(tid, kind=None):
+    t = next((x for x in teachers() if x["id"] == tid), None)
+    if not t or (kind and t["kind"] != kind):
+        raise ValueError("Pick a teacher from the list.")
+    return t
+
+
+def fetch_agent_card(base):
+    hdr = {"User-Agent": "finetune-studio/1.0"}
+    out = {"ok": False}
+    try:
+        base = base.rstrip("/")
+        with urllib.request.urlopen(urllib.request.Request(base + "/health", headers=hdr), timeout=15) as r:
+            out["health"] = r.read().decode("utf-8", "replace")[:200]
+        with urllib.request.urlopen(urllib.request.Request(base + "/agent.md", headers=hdr), timeout=15) as r:
+            md = r.read().decode("utf-8", "replace")
+        m = re.search(r"```json\s*(\{.*?\})\s*```", md, re.S)
+        card = json.loads(m.group(1)) if m else {}
+        out.update({"ok": True, "name": card.get("display_name") or card.get("agent_id"),
+                    "description": card.get("description"), "version": card.get("version"),
+                    "capability": (card.get("capabilities") or ["text-extract"])[0],
+                    "invokePath": card.get("invoke_path"), "inputs": card.get("input_schema") or {}})
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def teacher_test(tid):
+    """Check an allowlisted teacher from the server (model: say hello; agent: health + card)."""
+    t = get_teacher(tid)
+    if t["kind"] == "agent":
+        c = fetch_agent_card(t["url"])
+        return {"ok": c["ok"], "info": (f"{c.get('name')} v{c.get('version')}: {c.get('description') or ''}"
+                                        if c["ok"] else c.get("error", "unreachable"))}
+    t0 = time.time()
+    key = os.environ.get(t.get("key_env") or "", "")
+    try:
+        req = urllib.request.Request(
+            t["base_url"].rstrip("/") + "/chat/completions",
+            data=json.dumps({"model": t["model"], "max_tokens": 256, "temperature": 0,
+                             "chat_template_kwargs": {"enable_thinking": False},
+                             "messages": [{"role": "user", "content": "Say: hello world"}]}).encode(),
+            headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {key}"} if key else {})})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            msg = json.load(r)["choices"][0]["message"]
+        reply = (msg.get("content") or msg.get("reasoning_content") or "").strip() or "(connected, empty reply)"
+        return {"ok": True, "info": f'Connected in {int((time.time() - t0) * 1000)} ms. Model replied: "{reply}"'}
+    except Exception as e:
+        return {"ok": False, "info": f"Teacher is not reachable right now: {type(e).__name__}"}
+
+
+def ws_teacher_run(wid, body):
+    w = ws_dir(wid)
+    t = get_teacher(body.get("teacher"))
+    if not (w / "teacher_inputs").is_dir():
+        raise ValueError("Upload the input files (.zip) first.")
+    if any(j["running"] for j in (view(x) for x in load()) if j["name"].endswith(":teacher")):
+        raise ValueError("A teacher job is already running; wait for it to finish.")
+    py = ROOT / "venv/bin/python"
+    py = str(py) if py.exists() else "python3"
+    out, env = w / "teacher_out", {}
+    shutil.rmtree(out, ignore_errors=True)
+    if t["kind"] == "model":
+        prompt = (body.get("prompt") or "").strip()
+        if not prompt or len(prompt) > 8000:
+            raise ValueError("Write a prompt (max 8000 characters).")
+        a = [py, str(Path(__file__).with_name("teacher_run.py")), str(w / "teacher_inputs"), "--out", str(out),
+             "--base-url", t["base_url"], "--model", t["model"],
+             "--dpi", str(clamp(body, "dpi", 72, 300, 200, int)),
+             "--max-tokens", str(clamp(body, "max_tokens", 256, 16384, 8192, int)),
+             "--workers", str(int(t.get("workers", 2))), "--limit", str(TEACHER_MAX_FILES),
+             "--postprocess", "markdown" if body.get("markdown", True) else "none"]
+        env = {"TEACHER_PROMPT": prompt, "TEACHER_API_KEY": os.environ.get(t.get("key_env") or "", "")}
+        if body.get("thinking"):
+            a.append("--allow-thinking")
+    else:
+        secret = os.environ.get(t.get("secret_env") or "", "")
+        if not secret:
+            raise ValueError("This agent is not configured on the server (its secret is not set).")
+        fields, instr = (body.get("fields") or "")[:2000], (body.get("instructions") or "")[:2000]
+        a = [py, str(Path(__file__).with_name("teacher_agent.py")), str(w / "teacher_inputs"), "--out", str(out),
+             "--url", t["url"], "--capability", t.get("capability", "text-extract"),
+             "--content-field", t.get("content_field", "md"), "--in-ext", t.get("in_ext", "md"),
+             "--workers", str(int(t.get("workers", 2))), "--timeout", str(clamp(body, "timeout", 30, 900, 600, int)),
+             "--limit", str(TEACHER_MAX_FILES), "--fields", fields, "--instructions", instr]
+        env = {"AGENT_SECRET": secret}
+    return start(f"ws:{wid}:teacher", shlex.join(a), env)
+
+
+def use_teacher_labels(wid):
+    """Student step: teacher inputs become the training inputs, teacher outputs the labels."""
+    w = ws_dir(wid)
+    src, lab = w / "teacher_inputs", w / "teacher_out"
+    if not src.is_dir() or not lab.is_dir():
+        raise ValueError("Run the teacher first.")
+    for name, d in (("inputs", src), ("labels", lab)):
+        shutil.rmtree(w / name, ignore_errors=True)
+        shutil.copytree(d, w / name, ignore=shutil.ignore_patterns("_raw", "flagged.txt"))
+    return {"ok": True}
+
+
 def ws_dir(wid):
     if not WID_RE.fullmatch(wid or ""):
         raise ValueError("bad workspace id")
@@ -180,7 +297,15 @@ def ws_status(wid):
         params = json.loads((w / "params.json").read_text())
     except Exception:
         params = None
-    return {"slots": {s: slot_info(w / s) for s in SLOTS},
+    tout = w / "teacher_out"
+    flagged = 0
+    try:
+        flagged = len([l for l in (tout / "flagged.txt").read_text().splitlines() if l.strip()])
+    except Exception:
+        pass
+    teacher = {"files": sum(1 for f in tout.rglob("*") if f.is_file() and "_raw" not in f.parts and f.name != "flagged.txt"),
+               "flagged": flagged, "mb": round(dir_size(tout) / 2**20, 1)} if tout.is_dir() else None
+    return {"teacher": teacher, "slots": {s: slot_info(w / s) for s in SLOTS},
             "lora": lora.is_dir(), "loraMB": round(dir_size(lora) / 2**20, 1),
             "merged": merged.is_dir(), "mergedGB": round(dir_size(merged) / 2**30, 1),
             "summary": summary, "params": params}
@@ -213,7 +338,8 @@ def ws_run(wid, body):
     epochs, lr = clamp(body, "epochs", 1, 30, 3), clamp(body, "lr", 1e-6, 1e-2, 1e-4)
     rank, max_len = clamp(body, "rank", 1, 256, 32, int), clamp(body, "max_len", 512, 32768, 8192, int)
     max_new, holdout = clamp(body, "max_new", 64, 8192, 2048, int), clamp(body, "holdout", 1, 50, 10)
-    if any(j["running"] for j in (view(x) for x in load()) if j["name"].startswith("ws:")):
+    if any(j["running"] for j in (view(x) for x in load())
+           if j["name"].startswith("ws:") and not j["name"].endswith(":teacher")):
         raise ValueError("A training job is already running; the GPU is shared, so wait for it to finish.")
     py = ROOT / "venv/bin/python"
     a = [str(py) if py.exists() else "python3", str(Path(__file__).with_name("quick_finetune.py")),
@@ -313,10 +439,10 @@ class H(BaseHTTPRequestHandler):
 
     def _download(self, wid, what):
         base = ws_dir(wid) / "out" / "outputs"
-        src = base / ("lora" if what == "lora" else "merged_16bit")
-        if what not in ("lora", "merged") or not src.is_dir():
+        src = ws_dir(wid) / "teacher_out" if what == "teacher" else base / ("lora" if what == "lora" else "merged_16bit")
+        if what not in ("lora", "merged", "teacher") or not src.is_dir():
             return self._send({"error": "nothing to download yet"}, 404)
-        name = "lora-adapter" if what == "lora" else "merged-model"
+        name = {"lora": "lora-adapter", "merged": "merged-model", "teacher": "teacher-labels"}[what]
         self.send_response(200)
         self.send_header("Content-Type", "application/zip")
         self.send_header("Content-Disposition", f'attachment; filename="{name}.zip"')
@@ -325,8 +451,8 @@ class H(BaseHTTPRequestHandler):
         st = ws_status(wid)
         with zipfile.ZipFile(_Stream(self.wfile), "w", zipfile.ZIP_STORED) as zf:
             for f in sorted(src.rglob("*")):
-                if f.is_file():
-                    zf.write(f, f"{'lora' if what == 'lora' else 'merged-model'}/{f.relative_to(src)}")
+                if f.is_file() and not (what == "teacher" and "_raw" in f.relative_to(src).parts):
+                    zf.write(f, f"{'lora' if what == 'lora' else 'merged-model' if what == 'merged' else 'labels'}/{f.relative_to(src)}")
             if what == "lora":
                 zf.writestr("README.md", readme(st["params"], st["summary"]))
                 zf.writestr("prompt.txt", (st["params"] or {}).get("prompt", ""))
@@ -337,6 +463,8 @@ class H(BaseHTTPRequestHandler):
         parts = u.path.strip("/").split("/")
         if u.path == "/api/info":
             return self._send({"root": "" if PUBLIC else str(ROOT), "public": PUBLIC})
+        if u.path == "/api/teachers":
+            return self._send([teacher_public(t) for t in teachers()])
         if u.path == "/api/allowed-models":
             return self._send([{k: m.get(k) for k in ("id", "label", "vision", "note")} for m in allowed_models()])
         if len(parts) >= 4 and parts[:2] == ["api", "ws"]:
@@ -426,6 +554,17 @@ class H(BaseHTTPRequestHandler):
                 return self._send(view(ws_run(parts[2], body)))
             except ValueError as e:
                 return self._send({"error": str(e)}, 400)
+        if len(parts) == 5 and parts[:2] == ["api", "ws"] and parts[3] == "teacher":
+            try:
+                ws_dir(parts[2])
+                if parts[4] == "run":
+                    return self._send(view(ws_teacher_run(parts[2], body)))
+                if parts[4] == "test":
+                    return self._send(teacher_test(body.get("teacher")))
+                if parts[4] == "use-labels":
+                    return self._send(use_teacher_labels(parts[2]))
+            except ValueError as e:
+                return self._send({"error": str(e)}, 400)
         if PUBLIC and not (len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "stop"):
             return self._send({"error": "disabled in public mode"}, 403)
         if parts == ["api", "jobs"]:
@@ -446,24 +585,7 @@ class H(BaseHTTPRequestHandler):
                 threading.Thread(target=_kill, daemon=True).start()
             return self._send({"ok": True})
         if parts == ["api", "agent-card"]:
-            base = body["url"].rstrip("/")
-            hdr = {"User-Agent": "finetune-studio/1.0"}
-            out = {"ok": False}
-            try:
-                with urllib.request.urlopen(urllib.request.Request(base + "/health", headers=hdr), timeout=15) as r:
-                    out["health"] = r.read().decode("utf-8", "replace")[:200]
-                with urllib.request.urlopen(urllib.request.Request(base + "/agent.md", headers=hdr), timeout=15) as r:
-                    md = r.read().decode("utf-8", "replace")
-                m = re.search(r"```json\s*(\{.*?\})\s*```", md, re.S)
-                card = json.loads(m.group(1)) if m else {}
-                out.update({"ok": True, "name": card.get("display_name") or card.get("agent_id"),
-                            "description": card.get("description"), "version": card.get("version"),
-                            "capability": (card.get("capabilities") or ["text-extract"])[0],
-                            "invokePath": card.get("invoke_path"),
-                            "inputs": card.get("input_schema") or {}})
-            except Exception as e:
-                out["error"] = str(e)
-            return self._send(out)
+            return self._send(fetch_agent_card(body["url"]))
         if parts == ["api", "mkdir"]:
             try:
                 Path(body["path"]).mkdir(parents=True, exist_ok=True)

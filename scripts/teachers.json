@@ -1,0 +1,9 @@
+[
+  {"id": "qwen36-local", "kind": "model", "label": "Qwen3.6-35B (local vLLM; reads images and PDFs)",
+   "base_url": "http://localhost:11500/v1", "model": "qwen3.6-35b-fp8", "vision": true, "workers": 2,
+   "note": "Needs the vllm-main4 service running."},
+  {"id": "md-json", "kind": "agent", "label": "byoa-md-json agent (markdown/text in, JSON out)",
+   "url": "http://localhost:5700", "secret_env": "FT_AGENT_SECRET_MD_JSON",
+   "capability": "text-extract", "content_field": "md", "in_ext": "md", "workers": 2,
+   "note": "Set FT_AGENT_SECRET_MD_JSON in the ft-api service environment."}
+]
