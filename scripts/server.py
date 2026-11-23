@@ -200,9 +200,11 @@ def ws_teacher_run(wid, body):
         if body.get("thinking"):
             a.append("--allow-thinking")
     else:
-        secret = os.environ.get(t.get("secret_env") or "", "")
-        if not secret:
-            raise ValueError("This agent is not configured on the server (its secret is not set).")
+        # A secret typed by the user wins over the server's; it goes to the job via env only (never argv, log or disk).
+        given = body.get("secret")
+        secret = given.strip() if isinstance(given, str) and given.strip() else os.environ.get(t.get("secret_env") or "", "")
+        if not secret or len(secret) > 512:
+            raise ValueError("Enter this agent's secret (the server has none configured for it).")
         fields, instr = (body.get("fields") or "")[:2000], (body.get("instructions") or "")[:2000]
         a = [py, str(Path(__file__).with_name("teacher_agent.py")), str(w / "teacher_inputs"), "--out", str(out),
              "--url", t["url"], "--capability", t.get("capability", "text-extract"),

@@ -24,6 +24,9 @@ class _TeacherScreenState extends State<TeacherScreen> {
   final dpi = TextEditingController(text: '200');
   final maxTok = TextEditingController(text: '8192');
   final timeout = TextEditingController(text: '600');
+  final secret =
+      TextEditingController(); // kept in memory only, sent with the run request
+  bool showSecret = false;
   bool markdownPost = true;
   bool thinking = false;
   Map<String, dynamic> ws = {};
@@ -54,6 +57,7 @@ class _TeacherScreenState extends State<TeacherScreen> {
   @override
   void dispose() {
     r.removeListener(_onRunner);
+    secret.dispose();
     super.dispose();
   }
 
@@ -70,7 +74,8 @@ class _TeacherScreenState extends State<TeacherScreen> {
       setState(() {
         teachers = t;
         promptPresets = p;
-        if (teacherId == null && options.isNotEmpty) teacherId = options.first['id'];
+        if (teacherId == null && options.isNotEmpty)
+          teacherId = options.first['id'];
         if (promptPreset == null && p.isNotEmpty && prompt.text.isEmpty) {
           promptPreset = p.first['name'];
           prompt.text = p.first['text'];
@@ -120,6 +125,14 @@ class _TeacherScreenState extends State<TeacherScreen> {
       setState(() => msg = 'Upload the input files (.zip) first.');
       return;
     }
+    final t = teacher;
+    if (mode == 1 &&
+        t != null &&
+        t['configured'] == false &&
+        secret.text.trim().isEmpty) {
+      setState(() => msg = "Enter the agent's secret first.");
+      return;
+    }
     try {
       await r.teacherRun({
         'teacher': teacherId,
@@ -133,6 +146,7 @@ class _TeacherScreenState extends State<TeacherScreen> {
           'fields': fields.text.trim(),
           'instructions': instructions.text.trim(),
           'timeout': int.tryParse(timeout.text) ?? 600,
+          if (secret.text.trim().isNotEmpty) 'secret': secret.text.trim(),
         },
       });
       setState(() => msg = 'Started. Logs appear on the right.');
@@ -224,7 +238,9 @@ class _TeacherScreenState extends State<TeacherScreen> {
                     selected: {mode},
                     onSelectionChanged: (v) => setState(() {
                       mode = v.first;
-                      teacherId = options.isNotEmpty ? options.first['id'] : null;
+                      teacherId = options.isNotEmpty
+                          ? options.first['id']
+                          : null;
                       testResult = null;
                       msg = null;
                     }),
@@ -256,27 +272,56 @@ class _TeacherScreenState extends State<TeacherScreen> {
                           testResult = null;
                         }),
                       ),
-                      if (notReady)
-                        const Padding(
-                          padding: EdgeInsets.only(top: 8),
-                          child: Text(
-                            'This teacher is not configured on the server yet, so it cannot run.',
-                            style: TextStyle(color: Colors.redAccent),
+                      if (mode == 1 && t != null) ...[
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: secret,
+                          obscureText: !showSecret,
+                          enableSuggestions: false,
+                          autocorrect: false,
+                          onChanged: (_) => setState(() {}),
+                          decoration: InputDecoration(
+                            labelText: notReady
+                                ? 'Agent secret (required)'
+                                : 'Agent secret (optional)',
+                            helperText: notReady
+                                ? 'The server has no secret for this agent. Enter yours; it is used for this run only and is not saved.'
+                                : 'Leave empty to use the server\'s secret, or enter your own for this run only.',
+                            helperMaxLines: 2,
+                            border: const OutlineInputBorder(),
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                showSecret
+                                    ? Icons.visibility_off
+                                    : Icons.visibility,
+                              ),
+                              onPressed: () =>
+                                  setState(() => showSecret = !showSecret),
+                            ),
                           ),
                         ),
+                      ],
                       gap(),
                       Row(
                         children: [
                           FilledButton.icon(
-                            onPressed: (testing || teacherId == null) ? null : test,
+                            onPressed: (testing || teacherId == null)
+                                ? null
+                                : test,
                             icon: testing
                                 ? const SizedBox(
                                     width: 16,
                                     height: 16,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
                                   )
                                 : const Icon(Icons.wifi_tethering),
-                            label: Text(mode == 0 ? 'Test connection (hello world)' : 'Test agent (health + card)'),
+                            label: Text(
+                              mode == 0
+                                  ? 'Test connection (hello world)'
+                                  : 'Test agent (health + card)',
+                            ),
                           ),
                           gap(),
                           if (testResult != null)
@@ -284,7 +329,9 @@ class _TeacherScreenState extends State<TeacherScreen> {
                               child: Text(
                                 '${testResult!['ok'] == true ? '✓' : '✗'} ${testResult!['info'] ?? testResult!['error']}',
                                 style: TextStyle(
-                                  color: testResult!['ok'] == true ? Colors.green : Colors.redAccent,
+                                  color: testResult!['ok'] == true
+                                      ? Colors.green
+                                      : Colors.redAccent,
                                 ),
                               ),
                             ),
@@ -305,11 +352,16 @@ class _TeacherScreenState extends State<TeacherScreen> {
                           ),
                           items: [
                             for (final p in promptPresets)
-                              DropdownMenuItem(value: p['name'] as String, child: Text(p['name'])),
+                              DropdownMenuItem(
+                                value: p['name'] as String,
+                                child: Text(p['name']),
+                              ),
                           ],
                           onChanged: (n) => setState(() {
                             promptPreset = n;
-                            prompt.text = promptPresets.firstWhere((p) => p['name'] == n)['text'];
+                            prompt.text = promptPresets.firstWhere(
+                              (p) => p['name'] == n,
+                            )['text'];
                           }),
                         ),
                         gap(),
@@ -350,7 +402,8 @@ class _TeacherScreenState extends State<TeacherScreen> {
                           minLines: 2,
                           maxLines: 5,
                           decoration: const InputDecoration(
-                            labelText: 'Extra instructions for the agent (optional)',
+                            labelText:
+                                'Extra instructions for the agent (optional)',
                             alignLabelWithHint: true,
                             border: OutlineInputBorder(),
                           ),
@@ -403,16 +456,24 @@ class _TeacherScreenState extends State<TeacherScreen> {
                               dense: true,
                               contentPadding: EdgeInsets.zero,
                               value: !thinking,
-                              onChanged: (v) => setState(() => thinking = !(v ?? true)),
-                              title: const Text('Disable thinking (sends enable_thinking=false; vLLM/Qwen3 only)'),
+                              onChanged: (v) =>
+                                  setState(() => thinking = !(v ?? true)),
+                              title: const Text(
+                                'Disable thinking (sends enable_thinking=false; vLLM/Qwen3 only)',
+                              ),
                             ),
                             CheckboxListTile(
                               dense: true,
                               contentPadding: EdgeInsets.zero,
                               value: markdownPost,
-                              onChanged: (v) => setState(() => markdownPost = v ?? true),
-                              title: const Text('Markdown clean-up (merge table rows, strip links, add page markers)'),
-                              subtitle: const Text('Turn off for non-document tasks to keep the raw model text.'),
+                              onChanged: (v) =>
+                                  setState(() => markdownPost = v ?? true),
+                              title: const Text(
+                                'Markdown clean-up (merge table rows, strip links, add page markers)',
+                              ),
+                              subtitle: const Text(
+                                'Turn off for non-document tasks to keep the raw model text.',
+                              ),
                             ),
                           ] else
                             TextField(
@@ -428,7 +489,11 @@ class _TeacherScreenState extends State<TeacherScreen> {
                       Row(
                         children: [
                           FilledButton.icon(
-                            onPressed: (job != null && job.running) || notReady ? null : run,
+                            onPressed:
+                                (job != null && job.running) ||
+                                    (notReady && !(mode == 1 && secret.text.trim().isNotEmpty))
+                                ? null
+                                : run,
                             icon: const Icon(Icons.play_arrow),
                             label: const Text('Run teacher in background'),
                           ),
@@ -436,7 +501,10 @@ class _TeacherScreenState extends State<TeacherScreen> {
                           if (job != null && job.running)
                             OutlinedButton.icon(
                               onPressed: () => r.stop(job),
-                              icon: const Icon(Icons.stop_circle_outlined, color: Colors.redAccent),
+                              icon: const Icon(
+                                Icons.stop_circle_outlined,
+                                color: Colors.redAccent,
+                              ),
                               label: const Text('Stop'),
                             ),
                           gap(),
@@ -459,7 +527,11 @@ class _TeacherScreenState extends State<TeacherScreen> {
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(0, 16, 16, 16),
                 child: job == null
-                    ? const Center(child: Text('No teacher job yet. Logs will appear here.'))
+                    ? const Center(
+                        child: Text(
+                          'No teacher job yet. Logs will appear here.',
+                        ),
+                      )
                     : LogViewer(runner: r, job: job),
               ),
             ),
